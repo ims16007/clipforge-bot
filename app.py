@@ -226,6 +226,8 @@ def transcribe(audio, work, cache=None, progress=lambda *a, **k: None, label="")
         saved = load_json(f"{cache}/chunk_{i:03d}.json") if cache else None
         if saved is not None:  # ya transcrito en un intento anterior: no se gasta cuota otra vez
             return saved
+        if os.path.getsize(path) < 10_000:  # sobrante de pocos segundos al final: Groq lo rechazaría
+            return {}
         j = groq_chunk(path)
         if cache:
             save_json(f"{cache}/chunk_{i:03d}.json", j)
@@ -1102,7 +1104,7 @@ GOOGLE = {"youtube": ("https://www.googleapis.com/auth/youtube", "YouTube"),
           "drive": ("https://www.googleapis.com/auth/drive.file", "Drive")}
 TT_API = "https://open.tiktokapis.com/v2"
 PRIVACY = {"Público": "public", "Oculto": "unlisted", "Privado": "private"}
-PLATFORMS = ["YouTube Shorts", "TikTok (privado en tu perfil)"]
+PLATFORMS = ["YouTube Shorts", "TikTok (notificaciones del móvil)"]
 _pending = {}  # login de YouTube a medias (código del dispositivo)
 
 
@@ -1200,7 +1202,7 @@ def yt_token(kind="youtube"):
 
 def tt_login_url():
     key, redirect = need_env("TIKTOK_CLIENT_KEY", "TIKTOK_REDIRECT_URI")
-    q = requests.compat.urlencode({"client_key": key, "scope": "user.info.basic,video.upload,video.publish",
+    q = requests.compat.urlencode({"client_key": key, "scope": "user.info.basic,video.upload",
                                    "response_type": "code", "redirect_uri": redirect, "state": os.urandom(8).hex()})
     url = f"https://www.tiktok.com/v2/auth/authorize/?{q}"
     return (f'<div class="code-box"><span>1. Abre</span><a href="{url}" target="_blank">Iniciar sesión en TikTok</a>'
@@ -1306,23 +1308,17 @@ def tt_chunks(size):
 
 
 def tt_upload(path, c=None):
-    """Publica en TikTok en PRIVADO («Solo yo») con descripción y hashtags: queda en tu perfil para revisarlo y
-    hacerlo público cuando quieras. Si la conexión aún no tiene permiso de publicar, se manda a la bandeja."""
+    """Manda el clip a TikTok: te llega a las notificaciones del móvil para publicarlo con su texto.
+    Sin auditar la app, TikTok solo deja publicar directamente si toda la cuenta es privada."""
     tok = tt_token()
     size = os.path.getsize(path)
     parts = tt_chunks(size)
-    source = {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": parts[0][1] - parts[0][0] + 1,
-              "total_chunk_count": len(parts)}
-    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=UTF-8"}
-    title, desc, tags = post_text(c or {})
-    caption = " ".join(x for x in (title, desc, tags) if x)[:2200]
-    r = requests.post(f"{TT_API}/post/publish/video/init/", timeout=60, headers=headers,
-                      json={"post_info": {"title": caption, "privacy_level": "SELF_ONLY"}, "source_info": source})
-    d, private = r.json(), True
-    if (d.get("error") or {}).get("code") in ("scope_not_authorized", "access_token_invalid_scope"):
-        r = requests.post(f"{TT_API}/post/publish/inbox/video/init/", timeout=60, headers=headers,
-                          json={"source_info": source})  # sin permiso de publicar: a la bandeja como antes
-        d, private = r.json(), False
+    r = requests.post(f"{TT_API}/post/publish/inbox/video/init/", timeout=60,
+                      headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=UTF-8"},
+                      json={"source_info": {"source": "FILE_UPLOAD", "video_size": size,
+                                            "chunk_size": parts[0][1] - parts[0][0] + 1,
+                                            "total_chunk_count": len(parts)}})
+    d = r.json()
     if (d.get("error") or {}).get("code") != "ok":
         err = d.get("error") or {}
         raise gr.Error("TikTok: " + (err.get("code") or "") + " " + err.get("message", r.text[:250]))
@@ -1333,8 +1329,7 @@ def tt_upload(path, c=None):
                               headers={"Content-Type": "video/mp4", "Content-Range": f"bytes {a}-{b}/{size}"})
             if up.status_code not in (200, 201, 206):
                 raise gr.Error(f"TikTok: fallo al subir ({up.status_code})")
-    return ("en tu perfil de TikTok en privado: hazlo público cuando quieras" if private
-            else "en tu bandeja de TikTok: ábrela en el móvil para publicarlo")
+    return "en tus notificaciones de TikTok: ábrelas en el móvil para publicarlo"
 
 
 def clip_label(f, c):
@@ -1622,13 +1617,9 @@ def live_analyze(vod, a, b, work, kind_n, min_s, max_s, avoid_music, progress, a
     """Transcribe y elige momentos del tramo [a, b] del directo."""
     sec = f"{work}/win_{int(a)}.mp4"
     off = fetch_section(hls_url(vod, "ba/b"), a, b, sec)
-    mp3 = f"{work}/win_{int(a)}.mp3"
-    run(["ffmpeg", "-y", "-v", "error", "-i", sec, "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k", mp3])
-    j = groq_chunk(mp3)
-    segs = [{"start": s["start"], "end": s["end"], "text": s["text"].strip()} for s in j.get("segments") or []]
-    words = [{"start": w["start"], "end": w["end"], "word": w["word"].strip()}
-             for w in j.get("words") or [] if w.get("word", "").strip()] or words_from_segs(segs)
-    db = loudness(mp3)
+    # en trozos de 20 min: un tramo de 2 h en un solo archivo supera lo que acepta Groq («Request Entity Too Large»)
+    segs, words = transcribe(sec, tempfile.mkdtemp(dir=work))
+    db = loudness(sec)
     music = music_ranges(segs, words, db, False)
     shift = lambda xs: [{**x, "start": x["start"] + off, "end": x["end"] + off} for x in xs]
     src = dict(dur=b, segs=[s for s in shift(segs) if s["start"] >= a], words=shift(words), chat=[], kind="directo",
@@ -1852,8 +1843,8 @@ footer {display:none !important;}
 """ % {"a": ACCENT}
 
 
-PUB_NOTE = ('<div class="note"><b>TikTok:</b> se publican en <b>privado en tu perfil</b> con su descripción; '
-            'hazlos públicos desde la app cuando quieras. <b>YouTube:</b> los canales nuevos pueden subir unos '
+PUB_NOTE = ('<div class="note"><b>TikTok:</b> te llegan a las <b>notificaciones de la app</b> del móvil; ábrelas '
+            'para publicarlos (si hay muchos sin abrir, TikTok no acepta más). <b>YouTube:</b> los canales nuevos pueden subir unos '
             '10 vídeos al día; lo que no quepa queda en tu Drive para subirlo desde «Biblioteca».</div>')
 
 

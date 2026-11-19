@@ -149,9 +149,11 @@ def publish(state, deadline, blocked):
                 if app.limit_hit(msg) or p == DRIVE:  # límite del día o sin permiso de Drive: otra vuelta
                     blocked.add(p)
                     print(f"{p}: límite alcanzado por ahora ({msg[:90]}); lo que falta queda en la cola.")
+                    app.notify(f"⚠️ {p}: no puedo subir más por ahora ({msg[:150]}). Lo pendiente queda en cola.")
                 else:  # error de este clip en concreto: no se reintenta
                     q["todo"].remove(p)
                     print(f"[{q['name']}] «{c.get('title')}» → {p}: error ({msg[:120]})")
+                    app.notify(f"⚠️ «{c.get('title')}» → {p}: error ({msg[:150]})")
         os.makedirs(OUT, exist_ok=True)
         os.replace(f, os.path.join(OUT, f"{q['name']}_{os.path.basename(f)}"))
         if not q["todo"]:
@@ -185,6 +187,9 @@ def main():
                     break
                 except app.gr.Error as e:  # un streamer que falla no para a los demás
                     print(f"[{name}] error: {getattr(e, 'message', e)}")
+                    app.notify(f"⚠️ [{name}] error: {str(getattr(e, 'message', e))[:200]}")
+                    # si sigue en directo, se reintenta en la siguiente comprobación en vez de dar la vuelta por acabada
+                    live_any = live_any or app.is_live(f"https://www.twitch.tv/{name}")
             uploads += publish(state, min(end, deadline + 15 * 60), blocked)
             save_state(fernet, state)
             if not live_any or time.time() > end - CHECK_EVERY:
@@ -197,7 +202,10 @@ def main():
         save_state(fernet, state)
     if live_any:  # el directo sigue: la siguiente vuelta se lanza ya, sin esperar al horario de GitHub
         open("relaunch", "w").close()
-    print(f"Listo: {added} momentos nuevos · {uploads} subidas · {len(state['queue'])} clips esperando en la cola.")
+    summary = f"{added} momentos nuevos · {uploads} subidas · {len(state['queue'])} clips esperando en la cola."
+    print("Listo: " + summary)
+    if added or uploads:
+        app.notify("Resumen de la vuelta: " + summary)
 
 
 if __name__ == "__main__":
