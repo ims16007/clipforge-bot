@@ -1,0 +1,3 @@
+# Un streamer de Twitch por línea (el nombre que sale en twitch.tv/NOMBRE).
+# Las líneas que empiezan por # no cuentan.
+illojuan

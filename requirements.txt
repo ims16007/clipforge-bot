@@ -1,0 +1,6 @@
+gradio
+requests
+numpy
+yt-dlp
+opencv-python-headless<5
+cryptography
