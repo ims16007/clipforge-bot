@@ -1096,8 +1096,10 @@ def done_stats(files, to_drive, videos=1):
 
 # ───────────────────────── Publicar: cuentas ─────────────────────────
 
-# youtube: subir vídeos · drive.file: el bot guarda en tu Drive los clips para revisar (solo los que él crea)
-YT_SCOPE = "https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/drive.file"
+# Google no deja pedir YouTube y Drive juntos con el login por código: son dos conexiones aparte.
+# drive.file: el bot guarda en tu Drive los clips para revisar (solo ve los archivos que él crea)
+GOOGLE = {"youtube": ("https://www.googleapis.com/auth/youtube", "YouTube"),
+          "drive": ("https://www.googleapis.com/auth/drive.file", "Drive")}
 TT_API = "https://open.tiktokapis.com/v2"
 PRIVACY = {"Público": "public", "Oculto": "unlisted", "Privado": "private"}
 PLATFORMS = ["YouTube Shorts", "TikTok (privado en tu perfil)"]
@@ -1136,22 +1138,23 @@ def need_env(*keys):
     return [os.environ[k] for k in keys]
 
 
-def yt_start():
+def yt_start(kind="youtube"):
     cid, = need_env("YT_CLIENT_ID")
-    r = requests.post("https://oauth2.googleapis.com/device/code", data={"client_id": cid, "scope": YT_SCOPE}, timeout=30)
+    r = requests.post("https://oauth2.googleapis.com/device/code", timeout=30,
+                      data={"client_id": cid, "scope": GOOGLE[kind][0]})
     if r.status_code != 200:
         raise gr.Error("Google rechazó el login: " + r.text[:300])
-    j = _pending["yt"] = r.json()
+    j = _pending[kind] = r.json()
     return (f'<div class="code-box"><span>1. Abre</span><a href="{j["verification_url"]}" target="_blank">'
             f'{j["verification_url"]}</a><span>2. Escribe este código</span><b>{j["user_code"]}</b>'
-            f'<span>3. Elige tu canal, acepta y pulsa <b style="font-size:1em">Ya lo autoricé</b></span></div>')
+            f'<span>3. Elige la cuenta, acepta y pulsa <b style="font-size:1em">Ya lo autoricé</b></span></div>')
 
 
-def yt_finish():
+def yt_finish(kind="youtube"):
     cid, secret = need_env("YT_CLIENT_ID", "YT_CLIENT_SECRET")
-    j = _pending.get("yt")
+    j = _pending.get(kind)
     if not j:
-        raise gr.Error("Primero pulsa «Conectar YouTube».")
+        raise gr.Error(f"Primero pulsa «Conectar {GOOGLE[kind][1]}».")
     wait, deadline = j.get("interval", 5), time.time() + 90
     while time.time() < deadline:
         d = requests.post("https://oauth2.googleapis.com/token", timeout=30, data={
@@ -1159,27 +1162,28 @@ def yt_finish():
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code"}).json()
         if "access_token" in d:
             acc = load_accounts()
-            acc["youtube"] = {"refresh_token": d.get("refresh_token"), "access_token": d["access_token"],
-                              "expires": time.time() + d.get("expires_in", 3600) - 60}
-            ch = requests.get("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true",
-                              headers={"Authorization": f"Bearer {d['access_token']}"}, timeout=30).json()
-            items = ch.get("items") or []
-            acc["youtube"]["name"] = items[0]["snippet"]["title"] if items else "tu canal"
+            acc[kind] = {"refresh_token": d.get("refresh_token"), "access_token": d["access_token"],
+                         "expires": time.time() + d.get("expires_in", 3600) - 60, "name": "tu Drive"}
+            if kind == "youtube":
+                ch = requests.get("https://www.googleapis.com/youtube/v3/channels?part=snippet&mine=true",
+                                  headers={"Authorization": f"Bearer {d['access_token']}"}, timeout=30).json()
+                items = ch.get("items") or []
+                acc[kind]["name"] = items[0]["snippet"]["title"] if items else "tu canal"
             save_accounts(acc)
-            _pending.pop("yt", None)
+            _pending.pop(kind, None)
             return accounts_html()
         if d.get("error") == "slow_down":
             wait += 5
         elif d.get("error") != "authorization_pending":
-            raise gr.Error("YouTube: " + d.get("error_description", d.get("error", "error desconocido")))
+            raise gr.Error(f"{GOOGLE[kind][1]}: " + d.get("error_description", d.get("error", "error desconocido")))
         time.sleep(wait)
     raise gr.Error("Aún no veo la autorización. Termina en la página de Google y vuelve a pulsar «Ya lo autoricé».")
 
 
-def yt_token():
-    yt = load_accounts().get("youtube")
+def yt_token(kind="youtube"):
+    yt = load_accounts().get(kind)
     if not yt:
-        raise gr.Error("YouTube no está conectado (botón «Cuentas», arriba a la derecha).")
+        raise gr.Error(f"{GOOGLE[kind][1]} no está conectado (botón «Cuentas», arriba a la derecha).")
     if time.time() < yt.get("expires", 0):
         return yt["access_token"]
     cid, secret = need_env("YT_CLIENT_ID", "YT_CLIENT_SECRET")
@@ -1187,9 +1191,9 @@ def yt_token():
         "client_id": cid, "client_secret": secret, "refresh_token": yt.get("refresh_token"),
         "grant_type": "refresh_token"}).json()
     if "access_token" not in d:
-        raise gr.Error("La sesión de YouTube caducó: vuelve a conectarla en el botón «Cuentas» (arriba a la derecha).")
+        raise gr.Error(f"La sesión de {GOOGLE[kind][1]} caducó: vuelve a conectarla en «Cuentas» (arriba a la derecha).")
     acc = load_accounts()
-    acc["youtube"].update(access_token=d["access_token"], expires=time.time() + d.get("expires_in", 3600) - 60)
+    acc[kind].update(access_token=d["access_token"], expires=time.time() + d.get("expires_in", 3600) - 60)
     save_accounts(acc)
     return d["access_token"]
 
@@ -1259,7 +1263,8 @@ def accounts_html():
         state = f'<span class="dot on"></span>Conectado como {a.get("name", "")}' if a else \
                 '<span class="dot"></span>Sin conectar'
         return f'<div class="acc"><b>{name}</b><span class="acc-state">{state}</span></div>'
-    return f'<div class="accs">{card("youtube", "YouTube")}{card("tiktok", "TikTok")}</div>'
+    return (f'<div class="accs">{card("youtube", "YouTube")}{card("tiktok", "TikTok")}'
+            f'{card("drive", "Drive (para el bot)")}</div>')
 
 
 # ───────────────────────── Publicar: subidas ─────────────────────────
@@ -1378,12 +1383,12 @@ BOT_FOLDER = "ClipForge (bot)"  # carpeta de Drive donde el bot deja los clips p
 
 def drive_upload(path, folder=BOT_FOLDER):
     """Sube un clip y su .txt a tu Drive (lo usa el bot de GitHub, que no tiene Drive montado)."""
-    h = {"Authorization": f"Bearer {yt_token()}"}
+    h = {"Authorization": f"Bearer {yt_token('drive')}"}
     q = f"name='{folder}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
     r = requests.get("https://www.googleapis.com/drive/v3/files", headers=h, timeout=30,
                      params={"q": q, "fields": "files(id)"})
     if r.status_code != 200:
-        raise gr.Error("Drive: " + r.text[:200] + " (reconecta YouTube para dar permiso de Drive)")
+        raise gr.Error("Drive: " + r.text[:200] + " (conecta Drive en «Cuentas»)")
     files = r.json().get("files") or []
     fid = files[0]["id"] if files else requests.post(
         "https://www.googleapis.com/drive/v3/files", headers=h, timeout=30,
@@ -1911,6 +1916,15 @@ with gr.Blocks(title="ClipForge") as demo:
                 with gr.Row():
                     tt_ok = gr.Button("Guardar conexión")
                     tt_out = gr.Button("Desconectar", size="sm")
+        with gr.Column(elem_classes="group"):
+            gr.HTML('<div class="label">Drive (solo para el bot)</div><div class="hint">Permite que el bot de GitHub '
+                    'guarde en tu Drive los clips que tienes que revisar. Elige la misma cuenta de Google que usas '
+                    'en Colab.</div>')
+            with gr.Row():
+                dr_btn = gr.Button("Conectar Drive", variant="primary")
+                dr_done = gr.Button("Ya lo autoricé")
+                dr_out = gr.Button("Desconectar", size="sm")
+            dr_code = gr.HTML()
         with gr.Accordion("Cómo preparar YouTube y TikTok (solo la primera vez)", open=False):
             gr.HTML(GUIDE)
         acc_close = gr.Button("Cerrar")
@@ -2104,6 +2118,9 @@ with gr.Blocks(title="ClipForge") as demo:
     yt_btn.click(yt_start, None, yt_code)
     yt_done.click(yt_finish, None, acc_status).success(lambda: "", None, yt_code)
     yt_out.click(lambda: disconnect("youtube"), None, acc_status)
+    dr_btn.click(lambda: yt_start("drive"), None, dr_code)
+    dr_done.click(lambda: yt_finish("drive"), None, acc_status).success(lambda: "", None, dr_code)
+    dr_out.click(lambda: disconnect("drive"), None, acc_status)
     tt_btn.click(tt_login_url, None, tt_link)
     tt_ok.click(tt_connect, tt_paste, [acc_status, tt_paste])
     tt_out.click(lambda: disconnect("tiktok"), None, acc_status)
