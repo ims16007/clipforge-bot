@@ -593,7 +593,12 @@ def judge(cands, src, min_s, max_s, progress=lambda *a, **k: None):
     """Segunda pasada: la IA revisa cada candidato con su texto exacto, lo puntúa con rigor y afina los cortes."""
     def context(c):
         a, b = c["start"] - 10, c["end"] + 10
-        return " ".join(f"[{s['start']:.1f}] {s['text']}" for s in src["segs"] if a <= s["start"] <= b)
+        text = " ".join(f"[{s['start']:.1f}] {s['text']}" for s in src["segs"] if a <= s["start"] <= b)
+        # picos de volumen y de chat: una reacción fuerte vale aunque en el texto no se note
+        loud = [f"{t:.0f}" for t in src.get("loud", []) if a <= t <= b]
+        chat = [f"{t:.0f}" for t in src.get("chat", []) if a <= t <= b]
+        return (text + (f" [PICOS DE VOLUMEN en s: {', '.join(loud)}]" if loud else "")
+                + (f" [CHAT EXPLOTA en s: {', '.join(chat)}]" if chat else ""))
 
     def one(batch):
         items = "\n\n".join(f"ID {k} (clip propuesto {c['start']:.1f}-{c['end']:.1f} s): {context(c)}"
@@ -855,11 +860,13 @@ def render(src, c, idx, layout, cam, hook):
     if HAS_GPU:
         try:
             run(cmd(True))
-            done = True
+            done = clip_ok(out, e - s)
         except gr.Error:
             pass  # sin NVENC/CUDA en este entorno: se hace por CPU con la misma calidad
     if not done:
         run(cmd(False))
+        if not clip_ok(out, e - s):  # FFmpeg puede acabar «bien» sin haber leído nada: nunca se guarda un clip vacío
+            raise gr.Error(f"El clip «{c.get('title')}» salió vacío (no se pudo leer ese tramo del vídeo).")
     with open(out[:-4] + ".txt", "w", encoding="utf-8") as f:
         f.write(f"{c.get('title', '')}\n\n{c.get('description', '')}\n\n{c.get('hashtags', '')}\n")
     return out
@@ -989,19 +996,38 @@ def drive_dest(src, to_drive, folder):
     return dest
 
 
+def clip_ok(path, want):
+    """¿El clip tiene imagen y dura lo que debe? (un archivo vacío de 262 bytes no se abre en ningún reproductor)"""
+    try:
+        w, _, _, dur = probe(path)
+    except gr.Error:
+        return False
+    return w > 0 and dur >= min(want, 3) * 0.8
+
+
 def export(src, clips, layout, cam_pos, hook, to_drive, folder, progress, label=""):
     if not clips:
         raise gr.Error("No hay clips marcados para exportar.")
     dest = drive_dest(src, to_drive, folder)
     ensure_video(src, progress, label)
-    if layout == LAYOUTS[1] and cam_pos == CAM_POS[0]:
+    # Twitch: se bajan solo las piezas de cada clip (saltar dentro del vídeo con FFmpeg a veces no lee nada)
+    m3u8 = hls_url(src["url"], "bv*+ba/b") if "twitch.tv" in (src.get("url") or "") else None
+    cam_box = [None]
+    if layout == LAYOUTS[1] and not m3u8:
         progress(0, desc=f"{label}Buscando la webcam del streamer…")
-    cam = find_cam(src, cam_pos) if layout == LAYOUTS[1] else None
-    if layout == LAYOUTS[1] and not cam:
-        gr.Warning("No encontré tu cámara: elige su posición a mano. Uso encuadre centrado.")
+        cam_box[0] = find_cam(src, cam_pos)
+        if not cam_box[0]:
+            gr.Warning("No encontré tu cámara: elige su posición a mano. Uso encuadre centrado.")
 
     def job(i, c):
-        f = render(src, c, i, layout, cam, hook)
+        s = src
+        if m3u8:
+            sec = f"{src['work']}/sec_{i}.mp4"
+            off = fetch_section(m3u8, float(c["start"]) - 2, float(c["end"]) + 2, sec)
+            s = dict(src, video=sec, offset=off, audio_in=None, dur=float(c["end"]) + 2 - off)
+            if layout == LAYOUTS[1] and not cam_box[0]:  # se busca en el propio trozo hasta encontrarla
+                cam_box[0] = find_cam(s, cam_pos)
+        f = render(s, c, i, layout, cam_box[0], hook)
         if dest:  # se copia al momento: si Colab se corta, lo hecho ya está en Drive
             shutil.copy(f, dest)
             shutil.copy(f[:-4] + ".txt", dest)
@@ -1070,10 +1096,11 @@ def done_stats(files, to_drive, videos=1):
 
 # ───────────────────────── Publicar: cuentas ─────────────────────────
 
-YT_SCOPE = "https://www.googleapis.com/auth/youtube"  # el único de YouTube que permite el login por código
+# youtube: subir vídeos · drive.file: el bot guarda en tu Drive los clips para revisar (solo los que él crea)
+YT_SCOPE = "https://www.googleapis.com/auth/youtube https://www.googleapis.com/auth/drive.file"
 TT_API = "https://open.tiktokapis.com/v2"
 PRIVACY = {"Público": "public", "Oculto": "unlisted", "Privado": "private"}
-PLATFORMS = ["YouTube Shorts", "TikTok (bandeja de borradores)"]
+PLATFORMS = ["YouTube Shorts", "TikTok (privado en tu perfil)"]
 _pending = {}  # login de YouTube a medias (código del dispositivo)
 
 
@@ -1169,7 +1196,7 @@ def yt_token():
 
 def tt_login_url():
     key, redirect = need_env("TIKTOK_CLIENT_KEY", "TIKTOK_REDIRECT_URI")
-    q = requests.compat.urlencode({"client_key": key, "scope": "user.info.basic,video.upload",
+    q = requests.compat.urlencode({"client_key": key, "scope": "user.info.basic,video.upload,video.publish",
                                    "response_type": "code", "redirect_uri": redirect, "state": os.urandom(8).hex()})
     url = f"https://www.tiktok.com/v2/auth/authorize/?{q}"
     return (f'<div class="code-box"><span>1. Abre</span><a href="{url}" target="_blank">Iniciar sesión en TikTok</a>'
@@ -1273,18 +1300,27 @@ def tt_chunks(size):
     return [(i * TT_CHUNK, size - 1 if i == n - 1 else (i + 1) * TT_CHUNK - 1) for i in range(n)]
 
 
-def tt_upload(path):
+def tt_upload(path, c=None):
+    """Publica en TikTok en PRIVADO («Solo yo») con descripción y hashtags: queda en tu perfil para revisarlo y
+    hacerlo público cuando quieras. Si la conexión aún no tiene permiso de publicar, se manda a la bandeja."""
     tok = tt_token()
     size = os.path.getsize(path)
     parts = tt_chunks(size)
-    r = requests.post(f"{TT_API}/post/publish/inbox/video/init/", timeout=60,
-                      headers={"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=UTF-8"},
-                      json={"source_info": {"source": "FILE_UPLOAD", "video_size": size,
-                                            "chunk_size": parts[0][1] - parts[0][0] + 1,
-                                            "total_chunk_count": len(parts)}})
-    d = r.json()
+    source = {"source": "FILE_UPLOAD", "video_size": size, "chunk_size": parts[0][1] - parts[0][0] + 1,
+              "total_chunk_count": len(parts)}
+    headers = {"Authorization": f"Bearer {tok}", "Content-Type": "application/json; charset=UTF-8"}
+    title, desc, tags = post_text(c or {})
+    caption = " ".join(x for x in (title, desc, tags) if x)[:2200]
+    r = requests.post(f"{TT_API}/post/publish/video/init/", timeout=60, headers=headers,
+                      json={"post_info": {"title": caption, "privacy_level": "SELF_ONLY"}, "source_info": source})
+    d, private = r.json(), True
+    if (d.get("error") or {}).get("code") in ("scope_not_authorized", "access_token_invalid_scope"):
+        r = requests.post(f"{TT_API}/post/publish/inbox/video/init/", timeout=60, headers=headers,
+                          json={"source_info": source})  # sin permiso de publicar: a la bandeja como antes
+        d, private = r.json(), False
     if (d.get("error") or {}).get("code") != "ok":
-        raise gr.Error("TikTok: " + (d.get("error") or {}).get("message", r.text[:250]))
+        err = d.get("error") or {}
+        raise gr.Error("TikTok: " + (err.get("code") or "") + " " + err.get("message", r.text[:250]))
     with open(path, "rb") as f:
         for a, b in parts:
             f.seek(a)
@@ -1292,11 +1328,127 @@ def tt_upload(path):
                               headers={"Content-Type": "video/mp4", "Content-Range": f"bytes {a}-{b}/{size}"})
             if up.status_code not in (200, 201, 206):
                 raise gr.Error(f"TikTok: fallo al subir ({up.status_code})")
-    return "en tu bandeja de TikTok: ábrela en el móvil para publicarlo"
+    return ("en tu perfil de TikTok en privado: hazlo público cuando quieras" if private
+            else "en tu bandeja de TikTok: ábrela en el móvil para publicarlo")
 
 
 def clip_label(f, c):
     return f"{os.path.basename(f)[:4]} · nota {c.get('score')} · {c.get('title')}"
+
+
+LIMIT_NOTE = ("Límite del día alcanzado en esta plataforma (YouTube: unos 10 vídeos al día en canales nuevos; "
+              "TikTok: hay borradores sin revisar en tus notificaciones). El clip sigue en tu Drive: súbelo más "
+              "tarde desde «Biblioteca».")
+
+
+def registry_path():
+    return f"{DRIVE}/ClipForge/.subidas.json"
+
+
+def mark_uploaded(c, platform, result):
+    """Apunta en Drive qué clip se ha subido y dónde, para que la Biblioteca lo muestre.
+    shortcut: la clave es el título del clip; si dos clips tienen el mismo título comparten marca."""
+    if not os.path.isdir(DRIVE):
+        return
+    reg = load_json(registry_path()) or {}
+    reg.setdefault(str(c.get("title") or ""), {})[platform] = result
+    os.makedirs(os.path.dirname(registry_path()), exist_ok=True)
+    save_json(registry_path(), reg)
+
+
+def notify(text, video=None):
+    """Aviso al móvil por Discord (un webhook de un canal tuyo). Adjunta el clip si cabe en el límite de Discord
+    (unos 10 MB); si no, va solo el texto. Opcional: solo si está el Secreto DISCORD_WEBHOOK."""
+    hook = os.environ.get("DISCORD_WEBHOOK")
+    if not hook:
+        return
+    try:
+        if video and os.path.exists(video) and os.path.getsize(video) < 9.5e6:
+            with open(video, "rb") as f:
+                requests.post(hook, timeout=120, data={"payload_json": json.dumps({"content": text[:1900]})},
+                              files={"files[0]": (os.path.basename(video), f, "video/mp4")})
+        else:
+            requests.post(hook, timeout=30, json={"content": text[:1900]})
+    except requests.RequestException:
+        pass  # un aviso que no llega no debe parar los clips
+
+
+BOT_FOLDER = "ClipForge (bot)"  # carpeta de Drive donde el bot deja los clips para revisar
+
+
+def drive_upload(path, folder=BOT_FOLDER):
+    """Sube un clip y su .txt a tu Drive (lo usa el bot de GitHub, que no tiene Drive montado)."""
+    h = {"Authorization": f"Bearer {yt_token()}"}
+    q = f"name='{folder}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    r = requests.get("https://www.googleapis.com/drive/v3/files", headers=h, timeout=30,
+                     params={"q": q, "fields": "files(id)"})
+    if r.status_code != 200:
+        raise gr.Error("Drive: " + r.text[:200] + " (reconecta YouTube para dar permiso de Drive)")
+    files = r.json().get("files") or []
+    fid = files[0]["id"] if files else requests.post(
+        "https://www.googleapis.com/drive/v3/files", headers=h, timeout=30,
+        json={"name": folder, "mimeType": "application/vnd.google-apps.folder"}).json()["id"]
+    for p, mime in ((path, "video/mp4"), (path[:-4] + ".txt", "text/plain")):
+        r = requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", timeout=60,
+                          headers={**h, "X-Upload-Content-Type": mime},
+                          json={"name": os.path.basename(p), "parents": [fid]})
+        if "Location" not in r.headers:
+            raise gr.Error("Drive: " + r.text[:200])
+        with open(p, "rb") as f:
+            up = requests.put(r.headers["Location"], data=f, timeout=1800)
+        if up.status_code not in (200, 201):
+            raise gr.Error(f"Drive: fallo al subir ({up.status_code})")
+        if mime == "video/mp4":
+            link = f"https://drive.google.com/file/d/{up.json().get('id')}/view"
+    return link  # para abrir el clip desde el aviso
+
+
+# ───────────────────────── Biblioteca (clips guardados en Drive) ─────────────────────────
+
+def clip_meta(mp4):
+    """Título, descripción y hashtags del .txt que acompaña a cada clip."""
+    try:
+        parts = open(mp4[:-4] + ".txt", encoding="utf-8").read().split("\n\n")
+    except OSError:
+        parts = []
+    parts += ["", "", ""]
+    title = parts[0].strip() or os.path.splitext(os.path.basename(mp4))[0]
+    return {"title": title, "description": parts[1].strip(), "hashtags": parts[2].strip()}
+
+
+def library_items(folder):
+    roots = [f"{DRIVE}/{folder or 'ClipForge'}", f"{DRIVE}/{BOT_FOLDER}"]
+    found = [os.path.join(d, f) for r in roots if os.path.isdir(r) for d, _, fs in os.walk(r) for f in fs
+             if f.endswith(".mp4")]
+    return sorted(found, key=os.path.getmtime, reverse=True)
+
+
+def lib_label(path, meta, reg):
+    done = reg.get(meta["title"], {})
+    marks = " ".join(("✓ YouTube" if p == PLATFORMS[0] else "✓ TikTok") for p in done) or "Sin subir"
+    return f"[{marks}] {os.path.basename(os.path.dirname(path))} › {meta['title']}"
+
+
+def on_library(folder, only_pending):
+    if not os.path.isdir(DRIVE):
+        raise gr.Error("Google Drive no está conectado en Colab.")
+    reg = load_json(registry_path()) or {}
+    mapping = {}
+    for p in library_items(folder):
+        meta = clip_meta(p)
+        if only_pending and len(reg.get(meta["title"], {})) >= len(PLATFORMS):
+            continue
+        mapping[lib_label(p, meta, reg)] = p
+    labels = list(mapping)
+    note = " pendientes de subir" if only_pending else ""
+    summary = f'<div class="note"><b>{len(labels)}</b> clips{note} en tu Drive.</div>'
+    return (gr.update(choices=labels, value=[]), mapping,
+            gr.update(choices=labels, value=labels[0] if labels else None), summary)
+
+
+def on_lib_publish(mapping, picked, platforms, privacy, progress=gr.Progress()):
+    made = [(mapping[l], clip_meta(mapping[l])) for l in (picked or []) if l in mapping]
+    return on_publish(made, [clip_label(f, c) for f, c in made], platforms, privacy, progress)
 
 
 def on_publish(made, picked, platforms, privacy, progress=gr.Progress()):
@@ -1305,16 +1457,26 @@ def on_publish(made, picked, platforms, privacy, progress=gr.Progress()):
         raise gr.Error("Elige al menos un clip.")
     if not platforms:
         raise gr.Error("Elige YouTube, TikTok o ambos.")
-    rows, total, done = [], len(sel) * len(platforms), 0
+    rows, total, done, blocked = [], len(sel) * len(platforms), 0, set()
     for f, c in sel:
         for p in platforms:
             progress(done / total, desc=f"Subiendo a {p}: {c.get('title')}…")
+            if p in blocked:
+                rows.append(f"<tr><td class='err'>Pendiente</td><td>{p}</td><td>{c.get('title')}</td>"
+                            f"<td>{LIMIT_NOTE}</td></tr>")
+                done += 1
+                continue
             try:
-                res = yt_upload(f, c, PRIVACY[privacy]) if p == PLATFORMS[0] else tt_upload(f)
+                res = yt_upload(f, c, PRIVACY[privacy]) if p == PLATFORMS[0] else tt_upload(f, c)
+                mark_uploaded(c, p, res)
                 link = f'<a href="{res}" target="_blank">{res}</a>' if res.startswith("http") else res
                 rows.append(f"<tr><td class='ok'>Subido</td><td>{p}</td><td>{c.get('title')}</td><td>{link}</td></tr>")
             except gr.Error as e:  # un fallo no para el resto de subidas
-                rows.append(f"<tr><td class='err'>Error</td><td>{p}</td><td>{c.get('title')}</td><td>{getattr(e, 'message', e)}</td></tr>")
+                msg = str(getattr(e, "message", e))
+                if limit_hit(msg):  # límite del día: no se insiste con los demás clips en esta plataforma
+                    blocked.add(p)
+                    msg = LIMIT_NOTE
+                rows.append(f"<tr><td class='err'>Pendiente</td><td>{p}</td><td>{c.get('title')}</td><td>{msg}</td></tr>")
             done += 1
     return f'<table class="pub-log"><tr><th>Estado</th><th>Dónde</th><th>Clip</th><th>Resultado</th></tr>{"".join(rows)}</table>'
 
@@ -1383,6 +1545,7 @@ def on_auto(video, urls, n, min_s, max_s, avoid_music, layout, cam_pos, hook, to
 # FFmpeg no sabe saltar dentro de un vídeo que sigue creciendo, pero las piezas sí se pueden bajar sueltas.
 
 LIVE_WINDOW = 1800   # cada 30 min de directo se buscan clips
+AUTO_SCORE = 85      # en directo se suben solos los clips con esta nota o más; el resto te llega para revisar
 LIVE_BACKLOG = 7200  # lo ya emitido se analiza en tramos de 2 h (menos peticiones a la IA)
 LIVE_LAG = 60        # se deja 1 min de margen con el directo: las últimas piezas aún se están escribiendo
 
@@ -1502,7 +1665,8 @@ def live_publish(f, c, platforms, privacy, blocked):
         if p in blocked:
             continue
         try:
-            res = yt_upload(f, c, PRIVACY[privacy]) if p == PLATFORMS[0] else tt_upload(f)
+            res = yt_upload(f, c, PRIVACY[privacy]) if p == PLATFORMS[0] else tt_upload(f, c)
+            mark_uploaded(c, p, res)
             notes.append(f"{p}: {res}")
         except gr.Error as e:
             msg = str(getattr(e, "message", e))
@@ -1553,8 +1717,15 @@ def on_live(channel, per_window, min_s, max_s, avoid_music, layout, cam_pos, hoo
                 new = live_render(vod, clips, src, work, len(made) + 1, layout, cam_pos, hook, dest, cam_box)
                 for f, c in new:
                     made.append((f, c))
-                    notes = live_publish(f, c, platforms, privacy, blocked) if auto_pub else []
-                    log.append(f"{time.strftime('%H:%M')} · {c.get('title')}" + (" · " + " · ".join(notes) if notes else ""))
+                    top = float(c.get("score") or 0) >= AUTO_SCORE
+                    notes = live_publish(f, c, platforms, privacy, blocked) if auto_pub and top else []
+                    if notes:
+                        notify(f"Subido «{c.get('title')}» (nota {c.get('score')}): " + " · ".join(notes))
+                    else:  # no es de los mejores (o no hay subida automática): a revisar tú
+                        notify(f"Clip para revisar: «{c.get('title')}» (nota {c.get('score')}). Está en tu Drive: "
+                               f"súbelo desde la web › Biblioteca.", video=f)
+                    log.append(f"{time.strftime('%H:%M')} · {c.get('title')} (nota {c.get('score')})"
+                               + (" · " + " · ".join(notes) if notes else " · para revisar"))
                     yield update(f"Clip listo: {c.get('title')}")
                 pos = b
             except NoQuota as e:
@@ -1676,6 +1847,11 @@ footer {display:none !important;}
 """ % {"a": ACCENT}
 
 
+PUB_NOTE = ('<div class="note"><b>TikTok:</b> se publican en <b>privado en tu perfil</b> con su descripción; '
+            'hazlos públicos desde la app cuando quieras. <b>YouTube:</b> los canales nuevos pueden subir unos '
+            '10 vídeos al día; lo que no quepa queda en tu Drive para subirlo desde «Biblioteca».</div>')
+
+
 def status_html():
     gpu = ('<span><span class="dot on"></span>GPU activa</span>' if HAS_GPU else
            '<span><span class="dot warn"></span>Sin GPU<small>(más lento)</small></span>')
@@ -1739,111 +1915,148 @@ with gr.Blocks(title="ClipForge") as demo:
             gr.HTML(GUIDE)
         acc_close = gr.Button("Cerrar")
 
-    stepper = gr.HTML(stepper_html(1))
+    with gr.Tabs(elem_id="sections"):
+        with gr.Tab("Vídeos y directos completos"):
+            stepper = gr.HTML(stepper_html(1))
 
-    # ── Paso 1: vídeo ──
-    with gr.Column(visible=True) as s1:
-        head("¿De qué vídeo sacamos clips?",
-             "Directos de Twitch o YouTube, o vídeos normales de YouTube. Detecto el tipo y busco los momentos "
-             "de la forma adecuada.")
-        with gr.Tabs():
-            with gr.Tab("Pegar enlace"):
-                urls = gr.Textbox(show_label=False, lines=3, max_lines=12, elem_id="urls",
-                                  placeholder="https://www.twitch.tv/videos/123456789\nhttps://www.youtube.com/watch?v=…")
-                gr.HTML('<div class="hint">Puedes pegar varios, uno por línea. ¿Directo en emisión ahora mismo? '
-                        'Pega el canal (por ejemplo https://www.twitch.tv/illojuan) y en el paso 2 pulsa '
-                        '«Clipear el directo en vivo».</div>')
-            with gr.Tab("Subir archivo"):
-                # gr.File y no gr.Video: Gradio no reconvierte el archivo al subirlo (ahorra minutos en vídeos largos)
-                vid = gr.File(show_label=False, file_types=["video"], type="filepath", height=130)
-        with gr.Row(elem_classes="nav"):
-            gr.HTML("")
-            next1 = gr.Button("Siguiente: ajustes", variant="primary", scale=0, min_width=220)
+            # ── Paso 1: vídeo ──
+            with gr.Column(visible=True) as s1:
+                head("¿De qué vídeo sacamos clips?",
+                     "Directos de Twitch o YouTube, o vídeos normales de YouTube. Detecto el tipo y busco los momentos "
+                     "de la forma adecuada.")
+                with gr.Tabs():
+                    with gr.Tab("Pegar enlace"):
+                        urls = gr.Textbox(show_label=False, lines=3, max_lines=12, elem_id="urls",
+                                          placeholder="https://www.twitch.tv/videos/123456789\nhttps://www.youtube.com/watch?v=…")
+                        gr.HTML('<div class="hint">Puedes pegar varios, uno por línea. ¿Un directo que se está emitiendo '
+                                'ahora? Usa el apartado «En directo».</div>')
+                    with gr.Tab("Subir archivo"):
+                        # gr.File y no gr.Video: Gradio no reconvierte el archivo al subirlo (ahorra minutos en vídeos largos)
+                        vid = gr.File(show_label=False, file_types=["video"], type="filepath", height=130)
+                with gr.Row(elem_classes="nav"):
+                    gr.HTML("")
+                    next1 = gr.Button("Siguiente: ajustes", variant="primary", scale=0, min_width=220)
 
-    # ── Paso 2: ajustes y cómo hacerlo ──
-    with gr.Column(visible=False) as s2:
-        head("Ajustes", "Revisa cómo quieres los clips y elige cómo seguir.")
-        with gr.Row(equal_height=True):
-            with gr.Column(elem_classes="group"):
-                gr.HTML('<div class="label">Momentos</div>')
-                n = gr.Number(10, label="Clips por vídeo", minimum=1, maximum=5000, precision=0)
+            # ── Paso 2: ajustes y cómo hacerlo ──
+            with gr.Column(visible=False) as s2:
+                head("Ajustes", "Revisa cómo quieres los clips y elige cómo seguir.")
+                with gr.Row(equal_height=True):
+                    with gr.Column(elem_classes="group"):
+                        gr.HTML('<div class="label">Momentos</div>')
+                        n = gr.Number(10, label="Clips por vídeo", minimum=1, maximum=5000, precision=0)
+                        with gr.Row():
+                            min_s = gr.Slider(10, 60, 20, step=5, label="Mínimo (s)")
+                            max_s = gr.Slider(20, 90, 55, step=5, label="Máximo (s)")
+                        gr.HTML('<div class="hint">En vídeos editados de YouTube uso menos clips y más cortos (15–40 s).</div>')
+                    with gr.Column(elem_classes="group"):
+                        gr.HTML('<div class="label">Encuadre</div>')
+                        layout = gr.Radio(LAYOUTS, value=LAYOUTS[0], show_label=False, elem_id="layout")
+                        gr.HTML('<div class="hint">Seguir cara: el recorte sigue a quien habla. Streamer: webcam arriba y '
+                                'juego abajo. Centro: recorte fijo.</div>')
+                        cam_pos = gr.Dropdown(CAM_POS, value=CAM_POS[0], label="Webcam (solo modo Streamer)")
+                with gr.Row(equal_height=True):
+                    with gr.Column(elem_classes="group"):
+                        gr.HTML('<div class="label">Contenido</div>')
+                        hook = gr.Checkbox(True, label="Título del clip en los 3 primeros segundos")
+                        avoid_music = gr.Checkbox(True, label="Evitar tramos con música (menos reclamaciones)")
+                        gr.HTML('<div class="hint">Los subtítulos karaoke van siempre.</div>')
+                    with gr.Column(elem_classes="group"):
+                        gr.HTML('<div class="label">Guardar</div>')
+                        to_drive = gr.Checkbox(True, label="Guardar en Google Drive")
+                        folder = gr.Textbox("ClipForge", label="Carpeta", info="Dentro, una subcarpeta por vídeo")
+                with gr.Row(elem_classes="nav"):
+                    back2 = gr.Button("Atrás", scale=0, min_width=110)
+                    auto_btn = gr.Button("Hacerlo todo automático", scale=1)
+                    analyze_btn = gr.Button("Buscar momentos y revisarlos", variant="primary", scale=1)
+
+            # ── Paso 3: revisar ──
+            with gr.Column(visible=False) as s3:
+                head("Revisa los momentos", "Desmarca los que no quieras. Haz clic en una celda para cambiar tiempos, "
+                                            "título, descripción o hashtags.")
+                review_stats = gr.HTML()
+                table = gr.Dataframe(headers=COLUMNS, datatype=["bool", "number", "str", "number", "number", "str", "str"],
+                                     interactive=True, wrap=True, max_height=480, elem_id="review-table")
+                with gr.Row(elem_classes="nav"):
+                    back3 = gr.Button("Atrás", scale=0, min_width=110)
+                    gr.HTML("")
+                    export_btn = gr.Button("Crear los clips marcados", variant="primary", scale=0, min_width=240)
+
+            # ── Paso 4: clips ──
+            with gr.Column(visible=False) as s4:
+                head("Tus clips", "Haz clic en uno para verlo. Cada clip va con un .txt con título, descripción y hashtags.")
+                clip_stats = gr.HTML()
+                gallery = gr.Gallery(show_label=False, columns=5, height="auto", object_fit="cover", preview=False,
+                                     elem_id="gallery")
+                out = gr.File(label="Descargar todo (.zip)")
+                with gr.Row(elem_classes="nav"):
+                    restart = gr.Button("Empezar con otro vídeo", scale=0, min_width=220)
+                    gr.HTML("")
+                    next4 = gr.Button("Siguiente: publicar", variant="primary", scale=0, min_width=220)
+
+            # ── Paso 5: publicar ──
+            with gr.Column(visible=False) as s5:
+                head("Publicar", "Sube los clips a tus cuentas.")
+                gr.HTML(PUB_NOTE)
+                pub_accs = gr.HTML(accounts_html())
+                picked = gr.CheckboxGroup([], label="Clips")
                 with gr.Row():
-                    min_s = gr.Slider(10, 60, 20, step=5, label="Mínimo (s)")
-                    max_s = gr.Slider(20, 90, 55, step=5, label="Máximo (s)")
-                gr.HTML('<div class="hint">En vídeos editados de YouTube uso menos clips y más cortos (15–40 s).</div>')
-            with gr.Column(elem_classes="group"):
-                gr.HTML('<div class="label">Encuadre</div>')
-                layout = gr.Radio(LAYOUTS, value=LAYOUTS[0], show_label=False, elem_id="layout")
-                gr.HTML('<div class="hint">Seguir cara: el recorte sigue a quien habla. Streamer: webcam arriba y '
-                        'juego abajo. Centro: recorte fijo.</div>')
-                cam_pos = gr.Dropdown(CAM_POS, value=CAM_POS[0], label="Webcam (solo modo Streamer)")
-        with gr.Row(equal_height=True):
-            with gr.Column(elem_classes="group"):
-                gr.HTML('<div class="label">Contenido</div>')
-                hook = gr.Checkbox(True, label="Título del clip en los 3 primeros segundos")
-                avoid_music = gr.Checkbox(True, label="Evitar tramos con música (menos reclamaciones)")
-                gr.HTML('<div class="hint">Los subtítulos karaoke van siempre.</div>')
-            with gr.Column(elem_classes="group"):
-                gr.HTML('<div class="label">Guardar</div>')
-                to_drive = gr.Checkbox(True, label="Guardar en Google Drive")
-                folder = gr.Textbox("ClipForge", label="Carpeta", info="Dentro, una subcarpeta por vídeo")
-        with gr.Accordion("En directo (solo si pegaste el canal de un directo en emisión)", open=False):
+                    platforms = gr.CheckboxGroup(PLATFORMS, value=[PLATFORMS[0]], label="Dónde")
+                    privacy = gr.Radio(list(PRIVACY), value="Público", label="Visibilidad en YouTube")
+                pub_log = gr.HTML()
+                with gr.Row(elem_classes="nav"):
+                    back5 = gr.Button("Atrás", scale=0, min_width=110)
+                    acc_open2 = gr.Button("Conectar cuentas", scale=0, min_width=180)
+                    gr.HTML("")
+                    publish_btn = gr.Button("Publicar", variant="primary", scale=0, min_width=180)
+
+        # ── Directo en emisión ──
+        with gr.Tab("En directo"):
+            head("Clips mientras el directo sigue",
+                 "Pega el canal de Twitch. Cada 30 minutos busca los mejores momentos de lo nuevo, sube solos los "
+                 "muy buenos y de los demás te avisa para que los revises. Todo se guarda en tu Drive.")
+            live_chan = gr.Textbox(label="Canal de Twitch", placeholder="https://www.twitch.tv/illojuan")
             with gr.Row(equal_height=True):
                 with gr.Column(elem_classes="group"):
-                    live_n = gr.Number(3, label="Clips por cada 30 min de directo", minimum=1, maximum=20, precision=0)
+                    gr.HTML('<div class="label">Clips</div>')
+                    live_layout = gr.Radio(LAYOUTS, value=LAYOUTS[1], show_label=False, elem_id="layout")
+                    live_n = gr.Number(3, label="Momentos por cada 30 min de directo", minimum=1, maximum=20,
+                                       precision=0)
                     from_start = gr.Checkbox(True, label="Empezar desde el principio del directo (si no, desde ahora)")
                 with gr.Column(elem_classes="group"):
-                    auto_pub = gr.Checkbox(False, label="Subir cada clip automáticamente")
+                    gr.HTML('<div class="label">Subida</div>')
+                    auto_pub = gr.Checkbox(True, label=f"Subir solos los muy buenos (nota {AUTO_SCORE} o más)")
                     live_platforms = gr.CheckboxGroup(PLATFORMS, value=PLATFORMS, label="Dónde")
                     live_privacy = gr.Radio(list(PRIVACY), value="Público", label="Visibilidad en YouTube")
-        with gr.Row(elem_classes="nav"):
-            back2 = gr.Button("Atrás", scale=0, min_width=110)
-            live_btn = gr.Button("Clipear el directo en vivo", scale=1)
-            auto_btn = gr.Button("Hacerlo todo automático", scale=1)
-            analyze_btn = gr.Button("Buscar momentos y revisarlos", variant="primary", scale=1)
+            gr.HTML('<div class="hint">Los demás clips quedan en tu Drive y en «Biblioteca». Con Discord conectado '
+                    '(Secreto DISCORD_WEBHOOK) te llega un aviso al móvil por cada clip. Esto funciona '
+                    'mientras Colab esté abierto; para 24/7 usa el bot de GitHub.</div>')
+            with gr.Row(elem_classes="nav"):
+                stop_live = gr.Button("Parar", variant="stop", scale=0, min_width=140)
+                gr.HTML("")
+                live_btn = gr.Button("Empezar a clipear el directo", variant="primary", scale=0, min_width=260)
+            live_log = gr.HTML()
+            live_gallery = gr.Gallery(show_label=False, columns=5, height="auto", object_fit="cover",
+                                      preview=False, elem_id="gallery")
 
-    # ── Paso 3: revisar ──
-    with gr.Column(visible=False) as s3:
-        head("Revisa los momentos", "Desmarca los que no quieras. Haz clic en una celda para cambiar tiempos, "
-                                    "título, descripción o hashtags.")
-        review_stats = gr.HTML()
-        table = gr.Dataframe(headers=COLUMNS, datatype=["bool", "number", "str", "number", "number", "str", "str"],
-                             interactive=True, wrap=True, max_height=480, elem_id="review-table")
-        with gr.Row(elem_classes="nav"):
-            back3 = gr.Button("Atrás", scale=0, min_width=110)
-            gr.HTML("")
-            export_btn = gr.Button("Crear los clips marcados", variant="primary", scale=0, min_width=240)
-
-    # ── Paso 4: clips ──
-    with gr.Column(visible=False) as s4:
-        head("Tus clips", "Haz clic en uno para verlo. Cada clip va con un .txt con título, descripción y hashtags.")
-        clip_stats = gr.HTML()
-        gallery = gr.Gallery(show_label=False, columns=5, height="auto", object_fit="cover", preview=False,
-                             elem_id="gallery")
-        out = gr.File(label="Descargar todo (.zip)")
-        with gr.Row(elem_classes="nav"):
-            restart = gr.Button("Empezar con otro vídeo", scale=0, min_width=220)
-            stop_live = gr.Button("Parar el directo", variant="stop", scale=0, min_width=180)
-            gr.HTML("")
-            next4 = gr.Button("Siguiente: publicar", variant="primary", scale=0, min_width=220)
-
-    # ── Paso 5: publicar ──
-    with gr.Column(visible=False) as s5:
-        head("Publicar", "Sube los clips a tus cuentas.")
-        gr.HTML('<div class="note">YouTube deja en <b>privado</b> lo que suben apps sin verificar: cámbialo a público '
-                'en YouTube Studio. El plan gratis permite unas 6 subidas al día. TikTok los deja en tu '
-                '<b>bandeja de borradores</b>: ábrela en el móvil para publicarlos.</div>')
-        pub_accs = gr.HTML(accounts_html())
-        picked = gr.CheckboxGroup([], label="Clips")
-        with gr.Row():
-            platforms = gr.CheckboxGroup(PLATFORMS, value=[PLATFORMS[0]], label="Dónde")
-            privacy = gr.Radio(list(PRIVACY), value="Público", label="Visibilidad en YouTube")
-        pub_log = gr.HTML()
-        with gr.Row(elem_classes="nav"):
-            back5 = gr.Button("Atrás", scale=0, min_width=110)
-            acc_open2 = gr.Button("Conectar cuentas", scale=0, min_width=180)
-            gr.HTML("")
-            publish_btn = gr.Button("Publicar", variant="primary", scale=0, min_width=180)
+        # ── Biblioteca ──
+        with gr.Tab("Biblioteca") as lib_tab:
+            head("Biblioteca", "Todos los clips de tu Drive (los tuyos y los del bot). Míralos y súbelos cuando "
+                               "quieras, uno a uno o varios a la vez.")
+            lib_map = gr.State({})
+            with gr.Row():
+                lib_pending = gr.Checkbox(True, label="Ver solo los que faltan por subir")
+                lib_refresh = gr.Button("Actualizar", size="sm", scale=0, min_width=120)
+            lib_summary = gr.HTML()
+            with gr.Row(equal_height=False):
+                with gr.Column(elem_classes="group"):
+                    lib_view = gr.Dropdown([], label="Ver un clip")
+                    lib_video = gr.Video(show_label=False, height=480)
+                with gr.Column(elem_classes="group"):
+                    lib_pick = gr.CheckboxGroup([], label="Clips a subir")
+                    lib_platforms = gr.CheckboxGroup(PLATFORMS, value=PLATFORMS, label="Dónde")
+                    lib_privacy = gr.Radio(list(PRIVACY), value="Público", label="Visibilidad en YouTube")
+                    lib_pub = gr.Button("Subir los marcados", variant="primary")
+            lib_log = gr.HTML()
 
     # ── Navegación ──
     panels = [s1, s2, s3, s4, s5]
@@ -1876,11 +2089,18 @@ with gr.Blocks(title="ClipForge") as demo:
         .then(on_export, [src_state, table, layout, cam_pos, hook, to_drive, folder], made_out)
     auto_btn.click(to(4), None, nav_out) \
         .then(on_auto, [vid, urls, n, min_s, max_s, avoid_music, layout, cam_pos, hook, to_drive, folder], made_out)
-    live_job = live_btn.click(to(4), None, nav_out).then(
-        on_live, [urls, live_n, min_s, max_s, avoid_music, layout, cam_pos, hook, to_drive, folder, from_start,
-                  auto_pub, live_platforms, live_privacy], made_out)
-    stop_live.click(None, None, None, cancels=[live_job])
     publish_btn.click(on_publish, [made_state, picked, platforms, privacy], pub_log)
+    live_job = live_btn.click(
+        on_live, [live_chan, live_n, min_s, max_s, avoid_music, live_layout, cam_pos, hook, to_drive, folder,
+                  from_start, auto_pub, live_platforms, live_privacy],
+        [live_gallery, out, live_log, made_state, picked, pub_log])
+    stop_live.click(None, None, None, cancels=[live_job])
+    lib_args = ([folder, lib_pending], [lib_pick, lib_map, lib_view, lib_summary])
+    lib_tab.select(on_library, *lib_args)
+    lib_refresh.click(on_library, *lib_args)
+    lib_pending.change(on_library, *lib_args)
+    lib_view.change(lambda l, m: m.get(l), [lib_view, lib_map], lib_video)
+    lib_pub.click(on_lib_publish, [lib_map, lib_pick, lib_platforms, lib_privacy], lib_log).then(on_library, *lib_args)
     yt_btn.click(yt_start, None, yt_code)
     yt_done.click(yt_finish, None, acc_status).success(lambda: "", None, yt_code)
     yt_out.click(lambda: disconnect("youtube"), None, acc_status)
