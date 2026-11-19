@@ -516,9 +516,9 @@ KIND_HINT = {
 }
 
 
-def pick_window(segs, loud, chat, n, min_s, max_s, kind="directo", music=()):
+def pick_window(segs, loud, chat, n, min_s, max_s, kind="directo", music=(), avoid=()):
     try:
-        return ask_gemini(window_prompt(segs, loud, chat, n, min_s, max_s, kind, music))
+        return ask_gemini(window_prompt(segs, loud, chat, n, min_s, max_s, kind, music, avoid))
     except NoQuota:
         print("Gemini sin cuota: elijo los momentos con la reserva gratis de Groq (más lento).")
     groups = {}
@@ -529,11 +529,12 @@ def pick_window(segs, loud, chat, n, min_s, max_s, kind="directo", music=()):
     for g in groups.values():
         a, b = g[0]["start"], g[-1]["end"]
         clips += ask_groq_llm(window_prompt(g, [t for t in loud if a <= t <= b], [t for t in chat if a <= t <= b],
-                                            per, min_s, max_s, kind, [(x, y) for x, y in music if x < b and y > a]))
+                                            per, min_s, max_s, kind, [(x, y) for x, y in music if x < b and y > a],
+                                            avoid))
     return clips
 
 
-def window_prompt(segs, loud, chat, n, min_s, max_s, kind="directo", music=()):
+def window_prompt(segs, loud, chat, n, min_s, max_s, kind="directo", music=(), avoid=()):
     transcript = "\n".join(f"[{s['start']:.1f}-{s['end']:.1f}] {s['text']}" for s in segs) or "(sin diálogo)"
     signals = ""
     if loud:
@@ -543,6 +544,9 @@ def window_prompt(segs, loud, chat, n, min_s, max_s, kind="directo", music=()):
     if music:
         signals += ("\nTramos con MÚSICA (EVÍTALOS, dan problemas de derechos de autor): "
                     + ", ".join(f"{a:.0f}-{b:.0f}" for a, b in music))
+    if avoid:  # en directo, los tramos nuevos siguen hablando de lo de antes: que no se repita el mismo momento
+        signals += ("\nYA SE HAN HECHO CLIPS DE ESTOS MOMENTOS; NO propongas otro clip del mismo suceso aunque se "
+                    "vuelva a comentar: " + " | ".join(avoid[-40:]))
     prompt = (f"{KIND_HINT[kind]}\nEres editor experto de YouTube Shorts y TikTok. Con esta transcripción (tiempos en segundos) y estas "
               f"señales, elige los {n} mejores momentos virales: gancho fuerte al inicio, humor, emoción, reacción, "
               f"polémica o jugada épica, que se entiendan sin contexto. Los picos de volumen y de chat suelen marcar "
@@ -647,7 +651,7 @@ def pick_highlights(src, n, min_s, max_s, progress, avoid_music=True):
             chat = [t for t in src["chat"] if a <= t < b]
             mus = [(x, y) for x, y in music if x < b and y > a]
             if segs or loud or chat:
-                jobs.append(ex.submit(pick_window, segs, loud, chat, per, min_s, max_s, kind, mus))
+                jobs.append(ex.submit(pick_window, segs, loud, chat, per, min_s, max_s, kind, mus, src.get("avoid", ())))
         clips = [c for res in track(jobs, progress, 0.5, 0.8, "Buscando momentos:") for c in res]
     cands = no_music(dedupe([snap(c, w_starts, s_ends) for c in clips], src["dur"], min_s, max_s))[:2 * n + 10]
     if not cands:
@@ -1446,7 +1450,7 @@ def hls_url(vod, fmt):
     return urls[0]
 
 
-def live_analyze(vod, a, b, work, kind_n, min_s, max_s, avoid_music, progress):
+def live_analyze(vod, a, b, work, kind_n, min_s, max_s, avoid_music, progress, avoid=()):
     """Transcribe y elige momentos del tramo [a, b] del directo."""
     sec = f"{work}/win_{int(a)}.mp4"
     off = fetch_section(hls_url(vod, "ba/b"), a, b, sec)
@@ -1461,6 +1465,7 @@ def live_analyze(vod, a, b, work, kind_n, min_s, max_s, avoid_music, progress):
     shift = lambda xs: [{**x, "start": x["start"] + off, "end": x["end"] + off} for x in xs]
     src = dict(dur=b, segs=[s for s in shift(segs) if s["start"] >= a], words=shift(words), chat=[], kind="directo",
                loud=[t + off for t in loud_peaks(db) if t + off >= a], music=[[x + off, y + off] for x, y in music])
+    src["avoid"] = list(avoid)  # títulos de clips ya hechos de este directo
     return src, (pick_highlights(src, kind_n, min_s, max_s, progress, avoid_music) if src["segs"] else [])
 
 
@@ -1471,16 +1476,23 @@ def live_render(vod, clips, src, work, first, layout, cam_pos, hook, dest, cam_b
     for i, c in enumerate(clips, first):
         f = f"{work}/clip_{i}.mp4"
         off = fetch_section(m3u8, float(c["start"]) - 2, float(c["end"]) + 2, f)
-        w, h, fps, length = probe(f)
+        w, h, fps, _ = probe(f)  # la duración que da es «hasta dónde llega en el directo», no lo que dura el trozo
+        length = float(c["end"]) + 2 - off  # lo que dura el trozo de verdad: así la webcam se busca dentro de él
         clip_src = dict(src, work=work, video=f, offset=off, audio_in=None, w=w, h=h, fps=fps, dur=length)
-        if layout == LAYOUTS[1] and cam_box[0] is None:
-            cam_box[0] = find_cam(clip_src, cam_pos) or False  # se busca una vez por directo
+        if layout == LAYOUTS[1] and not cam_box[0]:  # hasta encontrarla: en un clip puede no mirar a cámara
+            cam_box[0] = find_cam(clip_src, cam_pos)
         out = render(clip_src, c, i, layout, cam_box[0] or None, hook)
         if dest:
             shutil.copy(out, dest)
             shutil.copy(out[:-4] + ".txt", dest)
         made.append((out, c))
     return made
+
+
+def limit_hit(msg):
+    """¿Error de límite de la plataforma (no del clip)? Entonces no tiene sentido seguir subiendo hoy ahí."""
+    m = msg.lower()
+    return any(k in m for k in ("quota", "exceeded", "uploadlimit", "spam_risk", "no está conectado", "caducó"))
 
 
 def live_publish(f, c, platforms, privacy, blocked):
@@ -1495,7 +1507,7 @@ def live_publish(f, c, platforms, privacy, blocked):
         except gr.Error as e:
             msg = str(getattr(e, "message", e))
             notes.append(f"{p}: error ({msg[:80]})")
-            if "quota" in msg.lower() or "no está conectado" in msg:
+            if limit_hit(msg):
                 blocked.add(p)
     return notes
 

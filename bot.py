@@ -1,20 +1,23 @@
 """ClipForge en piloto automático (GitHub Actions, cada 30 min).
 
-Para cada streamer de streamers.txt: si está en directo (o su último directo tiene un tramo sin revisar), analiza
-los tramos nuevos de 30 min, crea SOLO los clips que el juez IA puntúa alto y los sube a YouTube y TikTok.
-El estado (cuentas conectadas y por dónde va cada directo) se guarda cifrado en state.enc dentro del repositorio.
+1) Para cada streamer de streamers.txt: si está en directo (o a su último directo le falta un tramo por revisar),
+   analiza los tramos nuevos y apunta en una COLA solo los momentos que el juez IA puntúa alto.
+2) Sube la cola a YouTube y TikTok de mejor a peor nota. Lo que no cabe hoy (límites diarios de las plataformas)
+   se queda en la cola y se sube en las siguientes vueltas.
+El estado (cuentas, por dónde va cada directo y la cola) se guarda cifrado en state.enc dentro del repositorio.
 """
 import json, os, sys, tempfile, time
 from cryptography.fernet import Fernet
 
 import app
 
-MIN_SCORE = 70           # solo se crean los momentos que el juez puntúa 70/100 o más
+MIN_SCORE = 70           # solo entran en la cola los momentos con nota 70/100 o más
 CANDIDATES = 6           # momentos que se proponen por cada 30 min (luego se filtran por nota)
 MIN_S, MAX_S = 20, 45    # duración de los clips
 LAYOUT = app.LAYOUTS[1]  # Streamer: webcam arriba, juego abajo (si no hay webcam, recorte centrado)
 PLATFORMS = app.PLATFORMS
-WORK_BUDGET = 40 * 60    # trabajo máximo por ejecución; lo que falte se hace en la siguiente
+QUEUE_HOURS = 48         # un momento que no se ha podido subir en 2 días ya no es noticia: se descarta
+WORK_BUDGET = 40 * 60    # trabajo máximo por vuelta; lo que falte se hace en la siguiente
 STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "state.enc")
 OUT = os.environ.get("CLIPS_DIR", "clips")
 
@@ -28,9 +31,12 @@ def mask(value):
 def load_state(fernet):
     if os.path.exists(STATE):
         with open(STATE, "rb") as f:
-            return json.loads(fernet.decrypt(f.read()))
-    # primera vez: las cuentas vienen del secreto ACCOUNTS_JSON (el archivo .clipforge_cuentas.json de tu Drive)
-    return {"accounts": json.loads(os.environ.get("ACCOUNTS_JSON") or "{}"), "vods": {}}
+            state = json.loads(fernet.decrypt(f.read()))
+    else:  # primera vez: las cuentas vienen del secreto ACCOUNTS_JSON (el archivo .clipforge_cuentas.json de tu Drive)
+        state = {"accounts": json.loads(os.environ.get("ACCOUNTS_JSON") or "{}"), "vods": {}}
+    state.setdefault("queue", [])
+    state.setdefault("n", 0)
+    return state
 
 
 def save_state(fernet, state):
@@ -46,25 +52,22 @@ def streamers():
         return [l.strip().lstrip("@").lower() for l in f if l.strip() and not l.startswith("#")]
 
 
-def good(clips):
-    return [c for c in clips if float(c.get("score") or 0) >= MIN_SCORE]
-
-
-def process(name, state, deadline, blocked):
-    """Revisa los tramos pendientes del directo de un streamer. Devuelve cuántos clips ha subido."""
+def analyze(name, state, deadline):
+    """Revisa los tramos pendientes del directo de un streamer y mete en la cola los momentos buenos."""
     chan = f"https://www.twitch.tv/{name}"
     live = app.is_live(chan)
     try:
         _, vod, title = app.live_vod(chan)
     except app.gr.Error:
         return 0
-    info = state["vods"].setdefault(vod, {"pos": 0.0, "done": [], "title": title, "seen": time.time()})
+    info = state["vods"].setdefault(vod, {"pos": 0.0, "done": [], "titles": [], "title": title})
+    info.setdefault("titles", [])  # directos guardados por la versión anterior del bot
+    info["seen"] = time.time()
     if not live and info.get("finished"):
         return 0
     _, _, length = app.hls_index(app.hls_url(vod, "ba/b"))
     ready = length - app.LIVE_LAG if live else length
-    made = 0
-    work = tempfile.mkdtemp()
+    added, work = 0, tempfile.mkdtemp()
     while time.time() < deadline:
         pos = info["pos"]
         size = app.LIVE_BACKLOG if ready - pos > app.LIVE_BACKLOG else app.LIVE_WINDOW
@@ -73,22 +76,67 @@ def process(name, state, deadline, blocked):
         b = min(ready, pos + size)
         print(f"[{name}] analizando minuto {int(pos // 60)}–{int(b // 60)} de «{title}»")
         n = max(1, round(CANDIDATES * (b - pos) / app.LIVE_WINDOW))
-        src, clips = app.live_analyze(vod, pos, b, work, n, MIN_S, MAX_S, True, lambda *a, **k: None)
-        clips = [c for c in good(clips)
-                 if not any(min(e, c["end"]) - max(s, c["start"]) > 5 for s, e in info["done"])]
-        print(f"[{name}] {len(clips)} momentos con nota ≥ {MIN_SCORE}")
-        for f, c in app.live_render(vod, clips, src, work, len(info["done"]) + 1, LAYOUT, app.CAM_POS[0], True,
-                                    None, [None]):
-            notes = app.live_publish(f, c, PLATFORMS, "Público", blocked)
-            print(f"[{name}] «{c.get('title')}» (nota {c.get('score')}): " + " · ".join(notes))
-            os.makedirs(OUT, exist_ok=True)
-            os.replace(f, os.path.join(OUT, f"{name}_{os.path.basename(f)}"))
-            made += 1
-        info["done"] += [[float(c["start"]), float(c["end"])] for c in clips]
+        src, clips = app.live_analyze(vod, pos, b, work, n, MIN_S, MAX_S, True, lambda *a, **k: None,
+                                      avoid=info["titles"])
+        clips = [c for c in clips if float(c.get("score") or 0) >= MIN_SCORE
+                 and not any(min(e, c["end"]) - max(s, c["start"]) > 5 for s, e in info["done"])]
+        for c in clips:
+            s, e = float(c["start"]), float(c["end"])
+            state["queue"].append({"vod": vod, "name": name, "added": time.time(), "todo": list(PLATFORMS),
+                                   "clip": {k: c.get(k) for k in ("start", "end", "title", "description",
+                                                                  "hashtags", "score")},
+                                   "words": [w for w in src["words"] if w["end"] > s - 1 and w["start"] < e + 1]})
+            info["done"].append([s, e])
+            info["titles"].append(str(c.get("title") or ""))
+            print(f"[{name}] a la cola: «{c.get('title')}» (nota {c.get('score')})")
+        added += len(clips)
         info["pos"] = b
     if not live and ready - info["pos"] < 30:
         info["finished"] = True
-    return made
+    return added
+
+
+def publish(state, deadline, blocked):
+    """Sube la cola de mejor a peor nota. Devuelve cuántas subidas se han hecho."""
+    cutoff = time.time() - QUEUE_HOURS * 3600
+    state["queue"] = [q for q in state["queue"] if q["added"] > cutoff]
+    state["queue"].sort(key=lambda q: -float(q["clip"].get("score") or 0))
+    uploads, cams, work = 0, {}, tempfile.mkdtemp()
+    for q in list(state["queue"]):
+        todo = [p for p in q["todo"] if p not in blocked]
+        if time.time() > deadline or len(blocked) == len(PLATFORMS):
+            break
+        if not todo:
+            continue
+        c = q["clip"]
+        try:
+            state["n"] += 1
+            cam = cams.setdefault(q["vod"], [None])  # la webcam se busca una vez por directo
+            [(f, _)] = app.live_render(q["vod"], [c], {"words": q["words"]}, work, state["n"], LAYOUT,
+                                       app.CAM_POS[0], True, None, cam)
+        except app.gr.Error as e:  # el vídeo ya no está o falla al crearlo: se quita de la cola
+            print(f"[{q['name']}] no se pudo crear «{c.get('title')}»: {getattr(e, 'message', e)}")
+            state["queue"].remove(q)
+            continue
+        for p in todo:
+            try:
+                res = app.yt_upload(f, c, "public") if p == PLATFORMS[0] else app.tt_upload(f)
+                print(f"[{q['name']}] «{c.get('title')}» (nota {c.get('score')}) → {p}: {res}")
+                q["todo"].remove(p)
+                uploads += 1
+            except app.gr.Error as e:
+                msg = str(getattr(e, "message", e))
+                if app.limit_hit(msg):  # límite del día: se intenta en otra vuelta
+                    blocked.add(p)
+                    print(f"{p}: límite alcanzado por ahora ({msg[:90]}); lo que falta queda en la cola.")
+                else:  # error de este clip en concreto: no se reintenta
+                    q["todo"].remove(p)
+                    print(f"[{q['name']}] «{c.get('title')}» → {p}: error ({msg[:120]})")
+        os.makedirs(OUT, exist_ok=True)
+        os.replace(f, os.path.join(OUT, f"{q['name']}_{os.path.basename(f)}"))
+        if not q["todo"]:
+            state["queue"].remove(q)
+    return uploads
 
 
 def main():
@@ -103,22 +151,23 @@ def main():
     # las funciones de subida de app.py leen y renuevan las cuentas en este archivo
     with open(app.accounts_path(), "w", encoding="utf-8") as f:
         json.dump(state["accounts"], f)
-    deadline, blocked, total = time.time() + WORK_BUDGET, set(), 0
+    deadline, blocked, added, uploads = time.time() + WORK_BUDGET, set(), 0, 0
     try:
         for name in streamers():
             try:
-                total += process(name, state, deadline, blocked)
+                added += analyze(name, state, deadline)
             except app.NoQuota as e:
                 print(f"Sin cuota de IA por hoy: {getattr(e, 'message', e)}")
                 break
             except app.gr.Error as e:  # un streamer que falla no para a los demás
                 print(f"[{name}] error: {getattr(e, 'message', e)}")
+        uploads = publish(state, deadline + 15 * 60, blocked)
     finally:
         state["accounts"] = app.load_accounts()  # tokens renovados
         cutoff = time.time() - 7 * 86400  # se olvidan los directos de hace más de una semana
         state["vods"] = {k: v for k, v in state["vods"].items() if v.get("seen", 0) > cutoff}
         save_state(fernet, state)
-    print(f"Listo: {total} clips subidos en esta vuelta.")
+    print(f"Listo: {added} momentos nuevos · {uploads} subidas · {len(state['queue'])} clips esperando en la cola.")
 
 
 if __name__ == "__main__":
