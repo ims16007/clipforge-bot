@@ -11,11 +11,12 @@ concurrency:
 
 permissions:
   contents: write            # para guardar el progreso (state.enc)
+  actions: write             # para relanzarse si el directo sigue
 
 jobs:
   clips:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 350       # GitHub permite 6 h; el bot para a las 5 h 20
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +41,7 @@ jobs:
           TIKTOK_REDIRECT_URI: ${{ secrets.TIKTOK_REDIRECT_URI }}
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
           STATE_KEY: ${{ secrets.STATE_KEY }}
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: python bot.py
 
       - name: Guardar el progreso
@@ -49,6 +51,12 @@ jobs:
           git config user.email "clipforge-bot@users.noreply.github.com"
           git add state.enc
           git diff --cached --quiet || (git commit -q -m "Progreso de clips" && git push -q)
+
+      - name: Seguir si el directo continúa
+        if: always() && hashFiles('relaunch') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run clips.yml --ref main
 
       - name: Clips de esta vuelta (descargables 7 días)
         if: always()
