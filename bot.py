@@ -39,6 +39,12 @@ def load_state(fernet):
         state = {"accounts": json.loads(os.environ.get("ACCOUNTS_JSON") or "{}"), "vods": {}}
     state.setdefault("queue", [])
     state.setdefault("n", 0)
+    for q in state["queue"]:  # clips apuntados antes de existir lo de Drive: también se guardan allí
+        if not q.get("drive_checked"):
+            q["drive_checked"] = True
+            q.setdefault("top", True)
+            if DRIVE not in q["todo"]:
+                q["todo"].insert(0, DRIVE)
     # si cambias el secreto ACCOUNTS_JSON (al reconectar cuentas), manda la conexión nueva
     fresh = os.environ.get("ACCOUNTS_JSON") or ""
     sig = hashlib.sha256(fresh.encode()).hexdigest()
