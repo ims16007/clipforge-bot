@@ -42,7 +42,7 @@ jobs:
           ACCOUNTS_JSON: ${{ secrets.ACCOUNTS_JSON }}
           STATE_KEY: ${{ secrets.STATE_KEY }}
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: python bot.py
+        run: python -u bot.py   # -u: los mensajes salen en el registro al momento, no al final
 
       - name: Guardar el progreso
         if: always()
