@@ -105,7 +105,7 @@ def analyze(name, state, deadline):
             # los muy buenos van a la carpeta «para subir»; el resto a «ClipForge (bot)» para revisarlos
             top = rank < n_auto and float(c.get("score") or 0) >= app.AUTO_SCORE
             state["queue"].append({"vod": vod, "name": name, "added": time.time(), "top": top,
-                                   "stream": f"{info['date']} · {name} · {title}"[:100],
+                                   "stream": f"{info['date']} · {name} · {title.strip(' -·')}"[:100],
                                    "todo": [MANUAL] if top else [DRIVE],
                                    "clip": {k: c.get(k) for k in ("start", "end", "title", "description",
                                                                   "hashtags", "score")},
