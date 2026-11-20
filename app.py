@@ -1433,18 +1433,30 @@ def notify(text, video=None):
 BOT_FOLDER = "ClipForge (bot)"  # carpeta de Drive donde el bot deja los clips para revisar
 
 
-def drive_upload(path, folder=BOT_FOLDER):
-    """Sube un clip y su .txt a tu Drive (lo usa el bot de GitHub, que no tiene Drive montado)."""
-    h = {"Authorization": f"Bearer {yt_token('drive')}"}
-    q = f"name='{folder}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+def drive_folder(h, name, parent=None):
+    """Id de la carpeta de Drive con ese nombre (dentro de «parent» si se da); si no existe, la crea."""
+    safe = name.replace(chr(92), chr(92) * 2).replace("'", chr(92) + "'")
+    q = f"name='{safe}' and mimeType='application/vnd.google-apps.folder' and trashed=false"
+    if parent:
+        q += f" and '{parent}' in parents"
     r = requests.get("https://www.googleapis.com/drive/v3/files", headers=h, timeout=30,
                      params={"q": q, "fields": "files(id)"})
     if r.status_code != 200:
         raise gr.Error("Drive: " + r.text[:200] + " (conecta Drive en «Cuentas»)")
     files = r.json().get("files") or []
-    fid = files[0]["id"] if files else requests.post(
+    return files[0]["id"] if files else requests.post(
         "https://www.googleapis.com/drive/v3/files", headers=h, timeout=30,
-        json={"name": folder, "mimeType": "application/vnd.google-apps.folder"}).json()["id"]
+        json={"name": name, "mimeType": "application/vnd.google-apps.folder",
+              **({"parents": [parent]} if parent else {})}).json()["id"]
+
+
+def drive_upload(path, folder=BOT_FOLDER, sub=None):
+    """Sube un clip y su .txt a tu Drive (lo usa el bot de GitHub, que no tiene Drive montado).
+    «sub»: subcarpeta dentro de «folder» (una por directo)."""
+    h = {"Authorization": f"Bearer {yt_token('drive')}"}
+    fid = drive_folder(h, folder)
+    if sub:
+        fid = drive_folder(h, sub, fid)
     for p, mime in ((path, "video/mp4"), (path[:-4] + ".txt", "text/plain")):
         r = requests.post("https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable", timeout=60,
                           headers={**h, "X-Upload-Content-Type": mime},
