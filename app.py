@@ -605,12 +605,20 @@ def judge(cands, src, min_s, max_s, progress=lambda *a, **k: None):
     def one(batch):
         items = "\n\n".join(f"ID {k} (clip propuesto {c['start']:.1f}-{c['end']:.1f} s): {context(c)}"
                             for k, c in enumerate(batch))
+        about = src.get("about") or src.get("title")
+        # títulos concretos con quién y qué juego: es lo que la gente busca (los genéricos no llegan a nadie)
+        about = (f"Los clips son de «{about}». En el título di quién es el streamer y, si sale, el juego "
+                 f"(p. ej. «Illojuan…», «…en GTA 6»), contando lo que pasa en concreto, nada genérico. ") if about else ""
         prompt = (f"Eres el editor jefe de un canal viral de Shorts/TikTok. Revisa estos clips candidatos con rigor. "
+                  f"{about}Lo que vale es la reacción del streamer: si casi todo lo que se oye son diálogos del "
+                  f"juego, baja mucho la nota. "
                   f"Puntúa cada uno de 1 a 100 según: gancho en los 3 primeros segundos (lo más importante), se "
                   f"entiende sin contexto, tiene remate o punchline al final, emoción/humor/sorpresa, y sin tiempos "
                   f"muertos. Ajusta start/end para que empiece directamente en el gancho (sin saludos ni relleno) y "
                   f"acabe justo después del remate, entre {min_s} y {max_s} s. Mejora el título para que enganche. "
-                  f"Sé duro: un clip mediocre no pasa de 50. Usa el idioma del vídeo. Devuelve SOLO JSON: "
+                  f"Sé duro y reparte las notas de forma realista: la mayoría de candidatos deben quedar entre 40 y "
+                  f"75; más de 85 solo un momento excepcional que cualquiera compartiría, y casi nunca más de "
+                  f"uno de cada cinco. Un clip mediocre no pasa de 50. Usa el idioma del vídeo. Devuelve SOLO JSON: "
                   f"[{{\"id\":num,\"start\":num,\"end\":num,\"score\":1-100,\"title\":\"...\","
                   f"\"description\":\"...\",\"hashtags\":\"#... #shorts\"}}]\n\n{items}")
         out = []
@@ -730,8 +738,36 @@ def face_cmds(src, start, end, fps, crop_w, path):
     return True
 
 
+def all_faces(gray, sc):
+    """Todas las caras de una miniatura gris, en píxeles del vídeo original."""
+    return [(x / sc, y / sc, w / sc, h / sc) for x, y, w, h in CASCADE.detectMultiScale(gray, 1.1, 5, minSize=(20, 20))]
+
+
+def cam_from_shots(shots, w0, h0):
+    """Webcam = la cara que sale en el mismo sitio en muchas muestras. Las caras del juego (más grandes a menudo)
+    cambian de sitio y no se repiten. Si esa cara ocupa media pantalla no hay recuadro de cámara (charla)."""
+    def near(g, f):
+        return (abs(g[0] + g[2] / 2 - f[0] - f[2] / 2) < 0.05 * w0 and abs(g[1] + g[3] / 2 - f[1] - f[3] / 2) < 0.05 * w0
+                and 0.6 < g[2] / f[2] < 1.6)
+    best = []
+    for f in (f for faces in shots for f in faces):
+        same = [next(g for g in faces if near(g, f)) for faces in shots if any(near(g, f) for g in faces)]
+        if len(same) > len(best):
+            best = same
+    if len(best) < max(3, len(shots) // 5):
+        return None
+    fx, fy, fw, fh = np.median(best, axis=0)
+    if fw > 0.12 * w0:
+        return None
+    cw = min(w0, fw * 3)
+    ch = min(h0, cw * 0.75)
+    x = np.clip(fx + fw / 2 - cw / 2, 0, w0 - cw)
+    y = np.clip(fy + fh / 2 - ch * 0.45, 0, h0 - ch)
+    return x, y, cw, ch
+
+
 def find_cam(src, pos):
-    """Zona de la webcam (x, y, w, h). Auto: alrededor de la cara más repetida a lo largo del vídeo."""
+    """Zona de la webcam (x, y, w, h). Auto: alrededor de la cara que se repite en el mismo sitio a lo largo del vídeo."""
     w0, h0 = src["w"], src["h"]
     if pos != CAM_POS[0]:
         cw, ch = w0 * 0.28, w0 * 0.28 * 9 / 16
@@ -740,20 +776,39 @@ def find_cam(src, pos):
         return x, y, cw, ch
     if not cv2:
         return None
-    sc, faces = FACE_H / h0, []
-    for k in range(1, 25):  # 24 muestras repartidas por todo el vídeo: posición de cámara más fiable
-        t = src["dur"] * k / 25
-        for g in gray_frames(src["video"], t, t + 0.1, w0, h0, 10)[:1]:
-            if f := biggest_face(g, sc):
-                faces.append(f)
-    if len(faces) < 4:
+    sc = FACE_H / h0
+    shots = [all_faces(g, sc) for k in range(1, 25)  # 24 muestras repartidas por todo el vídeo
+             for g in gray_frames(src["video"], src["dur"] * k / 25, src["dur"] * k / 25 + 0.1, w0, h0, 10)[:1]]
+    return cam_from_shots(shots, w0, h0)
+
+
+def vod_cam(m3u8, work, n=16):
+    """Webcam de un vídeo de Twitch mirando n piezas sueltas repartidas por todo el directo (no solo un clip)."""
+    if not cv2:
         return None
-    fx, fy, fw, fh = np.median(faces, axis=0)
-    cw = min(w0, fw * 3.4)
-    ch = min(h0, cw * 0.75)
-    x = np.clip(fx + fw / 2 - cw / 2, 0, w0 - cw)
-    y = np.clip(fy + fh / 2 - ch * 0.45, 0, h0 - ch)
-    return x, y, cw, ch
+    _, segs, dur = hls_index(m3u8)
+    shots, w0, h0, work = [], 0, 0, tempfile.mkdtemp(dir=work)  # carpeta propia: pueden ir varios clips a la vez
+    for k in range(1, n + 1):
+        f = f"{work}/cam_{k}.mp4"
+        try:
+            fetch_section(m3u8, dur * k / (n + 1), dur * k / (n + 1) + 0.5, f)
+            w0, h0, _, _ = probe(f)
+            shots += [all_faces(g, FACE_H / h0) for g in gray_frames(f, 0, 2, w0, h0, 1)[:2]]
+        except Exception:  # una pieza que falla no impide mirar las demás
+            continue
+    return cam_from_shots(shots, w0, h0) if shots else None
+
+
+def cam_seen(src, start, end, cam):
+    """¿Sale una cara dentro del recuadro de la webcam en este clip? (en las charlas la cámara ocupa toda la pantalla)"""
+    if not cv2 or not cam:
+        return bool(cam)
+    x, y, cw, ch = cam
+    off = src.get("offset", 0)
+    for g in gray_frames(src["video"], start - off, end - off, src["w"], src["h"], 10 / max(1, end - start)):
+        if any(x <= fx + fw / 2 <= x + cw and y <= fy + fh / 2 <= y + ch for fx, fy, fw, fh in all_faces(g, FACE_H / src["h"])):
+            return True
+    return False
 
 
 def fpath(p):
@@ -845,6 +900,8 @@ def render(src, c, idx, layout, cam, hook):
     name = re.sub(r"[^\w\- ]", "", c.get("title") or "clip")[:40].strip() or "clip"
     out = f"{work}/out/{idx:04d}_{name}.mp4"
     os.makedirs(f"{work}/out", exist_ok=True)
+    if layout == LAYOUTS[1] and not cam_seen(src, s, e, cam):
+        layout, cam = LAYOUTS[0], None
     sub_margin = H - CAM_H - 260 if layout == LAYOUTS[1] and cam else 430  # en streamer: justo bajo la cámara
     make_ass(src["words"], s, e, c.get("title"), hook, sub_margin, f"{work}/c{idx}.ass")
     chain = video_chain(src, s, e, src["fps"], layout, cam, f"{work}/c{idx}.cmd")
@@ -1027,8 +1084,8 @@ def export(src, clips, layout, cam_pos, hook, to_drive, folder, progress, label=
             sec = f"{src['work']}/sec_{i}.mp4"
             off = fetch_section(m3u8, float(c["start"]) - 2, float(c["end"]) + 2, sec)
             s = dict(src, video=sec, offset=off, audio_in=None, dur=float(c["end"]) + 2 - off)
-            if layout == LAYOUTS[1] and not cam_box[0]:  # se busca en el propio trozo hasta encontrarla
-                cam_box[0] = find_cam(s, cam_pos)
+            if layout == LAYOUTS[1] and not cam_box[0]:  # se busca en todo el directo y, si no, en el propio trozo
+                cam_box[0] = (cam_pos == CAM_POS[0] and vod_cam(m3u8, src["work"])) or find_cam(s, cam_pos)
         f = render(s, c, i, layout, cam_box[0], hook)
         if dest:  # se copia al momento: si Colab se corta, lo hecho ya está en Drive
             shutil.copy(f, dest)
@@ -1613,7 +1670,7 @@ def hls_url(vod, fmt):
     return urls[0]
 
 
-def live_analyze(vod, a, b, work, kind_n, min_s, max_s, avoid_music, progress, avoid=()):
+def live_analyze(vod, a, b, work, kind_n, min_s, max_s, avoid_music, progress, avoid=(), about=""):
     """Transcribe y elige momentos del tramo [a, b] del directo."""
     sec = f"{work}/win_{int(a)}.mp4"
     off = fetch_section(hls_url(vod, "ba/b"), a, b, sec)
@@ -1624,7 +1681,7 @@ def live_analyze(vod, a, b, work, kind_n, min_s, max_s, avoid_music, progress, a
     shift = lambda xs: [{**x, "start": x["start"] + off, "end": x["end"] + off} for x in xs]
     src = dict(dur=b, segs=[s for s in shift(segs) if s["start"] >= a], words=shift(words), chat=[], kind="directo",
                loud=[t + off for t in loud_peaks(db) if t + off >= a], music=[[x + off, y + off] for x, y in music])
-    src["avoid"] = list(avoid)  # títulos de clips ya hechos de este directo
+    src["avoid"], src["about"] = list(avoid), about  # títulos de clips ya hechos de este directo; de quién es
     return src, (pick_highlights(src, kind_n, min_s, max_s, progress, avoid_music) if src["segs"] else [])
 
 
@@ -1638,8 +1695,8 @@ def live_render(vod, clips, src, work, first, layout, cam_pos, hook, dest, cam_b
         w, h, fps, _ = probe(f)  # la duración que da es «hasta dónde llega en el directo», no lo que dura el trozo
         length = float(c["end"]) + 2 - off  # lo que dura el trozo de verdad: así la webcam se busca dentro de él
         clip_src = dict(src, work=work, video=f, offset=off, audio_in=None, w=w, h=h, fps=fps, dur=length)
-        if layout == LAYOUTS[1] and not cam_box[0]:  # hasta encontrarla: en un clip puede no mirar a cámara
-            cam_box[0] = find_cam(clip_src, cam_pos)
+        if layout == LAYOUTS[1] and not cam_box[0]:  # se busca en todo el directo y, si no, en el propio clip
+            cam_box[0] = (cam_pos == CAM_POS[0] and vod_cam(m3u8, work)) or find_cam(clip_src, cam_pos)
         out = render(clip_src, c, i, layout, cam_box[0] or None, hook)
         if dest:
             shutil.copy(out, dest)
@@ -1706,7 +1763,8 @@ def on_live(channel, per_window, min_s, max_s, avoid_music, layout, cam_pos, hoo
             yield update(f"Analizando del minuto {int(pos // 60)} al {int(b // 60)}…")
             try:
                 n = max(1, round(int(per_window or 3) * (b - pos) / LIVE_WINDOW))
-                src, clips = live_analyze(vod, pos, b, work, n, min_s, max_s, avoid_music, progress)
+                src, clips = live_analyze(vod, pos, b, work, n, min_s, max_s, avoid_music, progress,
+                                          about=f"{chan.rstrip('/').split('/')[-1]}: {title}")
                 clips = [c for c in clips if not any(min(e, c["end"]) - max(s, c["start"]) > 5 for s, e in seen)]
                 seen += [(float(c["start"]), float(c["end"])) for c in clips]
                 yield update(f"Creando {len(clips)} clips del minuto {int(pos // 60)} al {int(b // 60)}…")

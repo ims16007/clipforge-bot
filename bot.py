@@ -13,10 +13,15 @@ import app
 
 MIN_SCORE = 70           # solo entran en la cola los momentos con nota 70/100 o más
 CANDIDATES = 6           # momentos que se proponen por cada 30 min (luego se filtran por nota)
+KEEP_PER_30 = 3          # como mucho se crean los 3 mejores de cada 30 min de directo
+AUTO_PER_30 = 1          # y solo el mejor de cada 30 min se sube solo (si además llega a AUTO_SCORE)
 MIN_S, MAX_S = 20, 45    # duración de los clips
 LAYOUT = app.LAYOUTS[1]  # Streamer: webcam arriba, juego abajo (si no hay webcam, recorte centrado)
 PLATFORMS = app.PLATFORMS
 QUEUE_HOURS = 48         # un momento que no se ha podido subir en 2 días ya no es noticia: se descarta
+# Publicaciones repartidas a lo largo del día (rinden más que todas de golpe). En TikTok además así nunca se
+# llega al tope de ~5 clips esperando en tus notificaciones, si las abres a diario.
+SPACING = {"yt": 2 * 3600, "tt": 4 * 3600}
 WORK_BUDGET = 40 * 60    # trabajo máximo por tanda dentro de una vuelta
 RUN_BUDGET = 320 * 60    # una vuelta dura como mucho 5 h 20 (GitHub corta a las 6 h); si sigue el directo, se relanza
 CHECK_EVERY = 180        # mientras haya directo, se mira cada 3 min si hay tramo nuevo
@@ -92,13 +97,17 @@ def analyze(name, state, deadline):
         print(f"[{name}] analizando minuto {int(pos // 60)}–{int(b // 60)} de «{title}»")
         n = max(1, round(CANDIDATES * (b - pos) / app.LIVE_WINDOW))
         src, clips = app.live_analyze(vod, pos, b, work, n, MIN_S, MAX_S, True, lambda *a, **k: None,
-                                      avoid=info["titles"])
+                                      avoid=info["titles"], about=f"{name}: {title}")
         clips = [c for c in clips if float(c.get("score") or 0) >= MIN_SCORE
                  and not any(min(e, c["end"]) - max(s, c["start"]) > 5 for s, e in info["done"])]
-        for c in clips:
+        clips.sort(key=lambda c: -float(c.get("score") or 0))
+        per = (b - pos) / app.LIVE_WINDOW
+        clips = clips[:max(1, round(KEEP_PER_30 * per))]
+        n_auto = max(1, round(AUTO_PER_30 * per))
+        for rank, c in enumerate(clips):
             s, e = float(c["start"]), float(c["end"])
             # los muy buenos se suben solos; todos van además a tu Drive para verlos en la Biblioteca
-            top = float(c.get("score") or 0) >= app.AUTO_SCORE
+            top = rank < n_auto and float(c.get("score") or 0) >= app.AUTO_SCORE
             state["queue"].append({"vod": vod, "name": name, "added": time.time(), "top": top,
                                    "todo": [DRIVE] + (list(PLATFORMS) if top else []),
                                    "clip": {k: c.get(k) for k in ("start", "end", "title", "description",
@@ -120,8 +129,11 @@ def publish(state, deadline, blocked):
     state["queue"] = [q for q in state["queue"] if q["added"] > cutoff]
     state["queue"].sort(key=lambda q: -float(q["clip"].get("score") or 0))
     uploads, cams, work = 0, {}, tempfile.mkdtemp()
+    last = state.setdefault("last_up", {})
+    kind = lambda p: "yt" if p == PLATFORMS[0] else "tt"
+    due = lambda p: p == DRIVE or time.time() - last.get(kind(p), 0) >= SPACING[kind(p)]
     for q in list(state["queue"]):
-        todo = [p for p in q["todo"] if p not in blocked]
+        todo = [p for p in q["todo"] if p not in blocked and due(p)]
         if time.time() > deadline or len(blocked) == len(PLATFORMS) + 1:
             break
         if not todo:
@@ -150,6 +162,8 @@ def publish(state, deadline, blocked):
                 print(f"[{q['name']}] «{c.get('title')}» (nota {c.get('score')}) → {p}: {res}")
                 q["todo"].remove(p)
                 uploads += 1
+                if p != DRIVE:
+                    last[kind(p)] = time.time()
             except app.gr.Error as e:
                 msg = str(getattr(e, "message", e))
                 if app.limit_hit(msg) or p == DRIVE:  # límite del día o sin permiso de Drive: otra vuelta
