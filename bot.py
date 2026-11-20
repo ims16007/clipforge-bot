@@ -76,6 +76,7 @@ def analyze(name, state, deadline):
     except app.gr.Error:
         return 0, live
     info = state["vods"].setdefault(vod, {"pos": 0.0, "done": [], "titles": [], "title": title})
+    info.setdefault("date", time.strftime("%Y-%m-%d"))  # día del directo: nombre de su carpeta en Drive
     info.setdefault("titles", [])  # directos guardados por la versión anterior del bot
     info["seen"] = time.time()
     if not live and info.get("finished"):
@@ -104,6 +105,7 @@ def analyze(name, state, deadline):
             # los muy buenos van a la carpeta «para subir»; el resto a «ClipForge (bot)» para revisarlos
             top = rank < n_auto and float(c.get("score") or 0) >= app.AUTO_SCORE
             state["queue"].append({"vod": vod, "name": name, "added": time.time(), "top": top,
+                                   "stream": f"{info['date']} · {name} · {title}"[:100],
                                    "todo": [MANUAL] if top else [DRIVE],
                                    "clip": {k: c.get(k) for k in ("start", "end", "title", "description",
                                                                   "hashtags", "score")},
@@ -143,12 +145,12 @@ def publish(state, deadline, blocked):
         for p in todo:
             try:
                 if p == DRIVE:
-                    link = app.drive_upload(f)
+                    link = app.drive_upload(f, sub=q.get("stream"))
                     res = f"en tu Drive ({app.BOT_FOLDER})"
                     app.notify(f"Clip para revisar ({q['name']}): «{c.get('title')}» (nota {c.get('score')})\n"
                                f"Verlo: {link}", video=f)
                 else:
-                    link = app.drive_upload(f, MANUAL_FOLDER)
+                    link = app.drive_upload(f, MANUAL_FOLDER, q.get("stream"))
                     res = f"en tu Drive ({MANUAL_FOLDER}) para subirlo tú"
                     app.notify(f"Para subir ({q['name']}): «{c.get('title')}» (nota {c.get('score')})\n"
                                f"Descárgalo: {link}\nTexto: {c.get('description') or ''} {c.get('hashtags') or ''}",
