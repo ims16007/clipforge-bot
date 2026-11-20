@@ -19,9 +19,8 @@ MIN_S, MAX_S = 20, 45    # duración de los clips
 LAYOUT = app.LAYOUTS[1]  # Streamer: webcam arriba, juego abajo (si no hay webcam, recorte centrado)
 PLATFORMS = app.PLATFORMS
 QUEUE_HOURS = 48         # un momento que no se ha podido subir en 2 días ya no es noticia: se descarta
-# Publicaciones repartidas a lo largo del día (rinden más que todas de golpe). En TikTok además así nunca se
-# llega al tope de ~5 clips esperando en tus notificaciones, si las abres a diario.
-SPACING = {"yt": 2 * 3600, "tt": 4 * 3600}
+YT_SPACING = 2 * 3600    # en YouTube, publicaciones repartidas a lo largo del día (rinden más que todas de golpe)
+TT_FOLDER = "ClipForge (TikTok)"  # TikTok no se sube solo: los buenos van a esta carpeta de Drive y los subes tú
 WORK_BUDGET = 40 * 60    # trabajo máximo por tanda dentro de una vuelta
 RUN_BUDGET = 320 * 60    # una vuelta dura como mucho 5 h 20 (GitHub corta a las 6 h); si sigue el directo, se relanza
 CHECK_EVERY = 180        # mientras haya directo, se mira cada 3 min si hay tramo nuevo
@@ -130,8 +129,7 @@ def publish(state, deadline, blocked):
     state["queue"].sort(key=lambda q: -float(q["clip"].get("score") or 0))
     uploads, cams, work = 0, {}, tempfile.mkdtemp()
     last = state.setdefault("last_up", {})
-    kind = lambda p: "yt" if p == PLATFORMS[0] else "tt"
-    due = lambda p: p == DRIVE or time.time() - last.get(kind(p), 0) >= SPACING[kind(p)]
+    due = lambda p: p != PLATFORMS[0] or time.time() - last.get("yt", 0) >= YT_SPACING
     for q in list(state["queue"]):
         todo = [p for p in q["todo"] if p not in blocked and due(p)]
         if time.time() > deadline or len(blocked) == len(PLATFORMS) + 1:
@@ -156,17 +154,23 @@ def publish(state, deadline, blocked):
                     if not q.get("top"):
                         app.notify(f"Clip para revisar ({q['name']}): «{c.get('title')}» (nota {c.get('score')})\n"
                                    f"Verlo: {link}\nSi te gusta, súbelo desde la web › Biblioteca.", video=f)
+                elif p == PLATFORMS[1]:
+                    link = app.drive_upload(f, TT_FOLDER)
+                    res = f"en tu Drive ({TT_FOLDER}) para subirlo tú"
+                    app.notify(f"Para TikTok ({q['name']}): «{c.get('title')}» (nota {c.get('score')})\n"
+                               f"Descárgalo: {link}\nTexto: {c.get('description') or ''} {c.get('hashtags') or ''}",
+                               video=f)
                 else:
-                    res = app.yt_upload(f, c, "public") if p == PLATFORMS[0] else app.tt_upload(f, c)
+                    res = app.yt_upload(f, c, "public")
                     app.notify(f"Subido ({q['name']}): «{c.get('title')}» (nota {c.get('score')}) → {p}: {res}")
                 print(f"[{q['name']}] «{c.get('title')}» (nota {c.get('score')}) → {p}: {res}")
                 q["todo"].remove(p)
                 uploads += 1
-                if p != DRIVE:
-                    last[kind(p)] = time.time()
+                if p == PLATFORMS[0]:
+                    last["yt"] = time.time()
             except app.gr.Error as e:
                 msg = str(getattr(e, "message", e))
-                if app.limit_hit(msg) or p == DRIVE:  # límite del día o sin permiso de Drive: otra vuelta
+                if app.limit_hit(msg) or p != PLATFORMS[0]:  # límite del día o sin permiso de Drive: otra vuelta
                     blocked.add(p)
                     print(f"{p}: límite alcanzado por ahora ({msg[:90]}); lo que falta queda en la cola.")
                     app.notify(f"⚠️ {p}: no puedo subir más por ahora ({msg[:150]}). Lo pendiente queda en cola.")
