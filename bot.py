@@ -75,12 +75,17 @@ def analyze(name, state, deadline):
         _, vod, title = app.live_vod(chan)
     except app.gr.Error:
         return 0, live
+    return scan(name, vod, title, live, state, deadline), live
+
+
+def scan(name, vod, title, live, state, deadline):
+    """Analiza lo que falte de un directo (en curso o ya acabado). Devuelve cuántos momentos ha metido en la cola."""
     info = state["vods"].setdefault(vod, {"pos": 0.0, "done": [], "titles": [], "title": title})
     info.setdefault("date", time.strftime("%Y-%m-%d"))  # día del directo: nombre de su carpeta en Drive
     info.setdefault("titles", [])  # directos guardados por la versión anterior del bot
     info["seen"] = time.time()
     if not live and info.get("finished"):
-        return 0, False
+        return 0
     _, _, length = app.hls_index(app.hls_url(vod, "ba/b"))
     ready = length - app.LIVE_LAG if live else length
     added, work = 0, tempfile.mkdtemp()
@@ -117,7 +122,7 @@ def analyze(name, state, deadline):
         info["pos"] = b
     if not live and ready - info["pos"] < 30:
         info["finished"] = True
-    return added, live
+    return added
 
 
 def publish(state, deadline, blocked):
@@ -199,6 +204,19 @@ def main():
                     app.notify(f"⚠️ [{name}] error: {str(getattr(e, 'message', e))[:200]}")
                     # si sigue en directo, se reintenta en la siguiente comprobación en vez de dar la vuelta por acabada
                     live_any = live_any or app.is_live(f"https://www.twitch.tv/{name}")
+            # directos antiguos que pediste repasar (state["backfill"]): después de los directos en curso
+            for job in list(state.get("backfill", []) if not no_quota else []):
+                try:
+                    added += scan(job["name"], job["vod"], job["title"], False, state, deadline)
+                except app.NoQuota as e:
+                    print(f"Sin cuota de IA por ahora: {getattr(e, 'message', e)}")
+                    no_quota = True
+                    break
+                except app.gr.Error as e:
+                    print(f"[{job['name']}] error en directo antiguo: {getattr(e, 'message', e)}")
+                if state["vods"].get(job["vod"], {}).get("finished"):
+                    state["backfill"].remove(job)
+            live_any = live_any or bool(state.get("backfill"))  # queda trabajo: la vuelta sigue y se relanza
             uploads += publish(state, min(end, deadline + 15 * 60), blocked)
             save_state(fernet, state)
             if not live_any or time.time() > end - CHECK_EVERY:
